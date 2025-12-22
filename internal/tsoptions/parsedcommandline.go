@@ -390,3 +390,27 @@ func (p *ParsedCommandLine) Locale() locale.Locale {
 	})
 	return p.locale
 }
+
+// WithFileNames creates a new ParsedCommandLine with the given file names
+// while preserving all other options from the original config.
+// This is used when --project is combined with explicit file arguments on the command line.
+func (p *ParsedCommandLine) WithFileNames(fileNames []string) *ParsedCommandLine {
+	parsedConfig := &core.ParsedOptions{
+		CompilerOptions:   p.ParsedConfig.CompilerOptions,
+		FileNames:         fileNames,
+		ProjectReferences: p.ParsedConfig.ProjectReferences,
+		TypeAcquisition:   p.ParsedConfig.TypeAcquisition,
+		WatchOptions:      p.ParsedConfig.WatchOptions,
+	}
+	return &ParsedCommandLine{
+		ParsedConfig:        parsedConfig,
+		ConfigFile:          p.ConfigFile,
+		Errors:              p.Errors,
+		Raw:                 p.Raw,
+		CompileOnSave:       p.CompileOnSave,
+		comparePathsOptions: p.comparePathsOptions,
+		// Don't copy wildcardDirectories or includeGlobs since we're using explicit files
+		extraFileExtensions: p.extraFileExtensions,
+		literalFileNamesLen: len(fileNames), // All files are explicit
+	}
+}
