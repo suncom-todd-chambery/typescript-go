@@ -157,11 +157,6 @@ func tscCompilation(ctx context.Context, sys tsc.System, commandLine *tsoptions.
 	}
 
 	if commandLine.CompilerOptions().Project != "" {
-		if len(commandLine.FileNames()) != 0 {
-			reportDiagnostic(ast.NewCompilerDiagnostic(diagnostics.Option_project_cannot_be_mixed_with_source_files_on_a_command_line))
-			return tsc.CommandLineResult{Status: tsc.ExitStatusDiagnosticsPresent_OutputsSkipped}
-		}
-
 		fileOrDirectory := tspath.NormalizePath(commandLine.CompilerOptions().Project)
 		if sys.FS().DirectoryExists(fileOrDirectory) {
 			configFileName = tspath.CombinePaths(fileOrDirectory, "tsconfig.json")
@@ -179,13 +174,8 @@ func tscCompilation(ctx context.Context, sys tsc.System, commandLine *tsoptions.
 	} else if !commandLine.CompilerOptions().IgnoreConfig.IsTrue() || len(commandLine.FileNames()) == 0 {
 		searchPath := tspath.NormalizePath(sys.GetCurrentDirectory())
 		configFileName = findConfigFile(searchPath, sys.FS().FileExists, "tsconfig.json")
-		if len(commandLine.FileNames()) != 0 {
-			if configFileName != "" {
-				// Error to not specify config file
-				reportDiagnostic(ast.NewCompilerDiagnostic(diagnostics.X_tsconfig_json_is_present_but_will_not_be_loaded_if_files_are_specified_on_commandline_Use_ignoreConfig_to_skip_this_error))
-				return tsc.CommandLineResult{Status: tsc.ExitStatusDiagnosticsPresent_OutputsSkipped}
-			}
-		} else if configFileName == "" {
+		// If no files specified and no config found, show help
+		if len(commandLine.FileNames()) == 0 && configFileName == "" {
 			if commandLine.CompilerOptions().ShowConfig.IsTrue() {
 				reportDiagnostic(ast.NewCompilerDiagnostic(diagnostics.Cannot_find_a_tsconfig_json_file_at_the_current_directory_Colon_0, tspath.NormalizePath(sys.GetCurrentDirectory())))
 			} else {
@@ -194,6 +184,8 @@ func tscCompilation(ctx context.Context, sys tsc.System, commandLine *tsoptions.
 			}
 			return tsc.CommandLineResult{Status: tsc.ExitStatusDiagnosticsPresent_OutputsSkipped}
 		}
+		// If files are specified and config is found, both will be used together
+		// (config options with command-line files)
 	}
 
 	// !!! convert to options with absolute paths is usually done here, but for ease of implementation, it's done in `tsoptions.ParseCommandLine()`
@@ -220,6 +212,10 @@ func tscCompilation(ctx context.Context, sys tsc.System, commandLine *tsoptions.
 			return tsc.CommandLineResult{Status: tsc.ExitStatusDiagnosticsPresent_OutputsGenerated}
 		}
 		configForCompilation = configParseResult
+		// If files were specified on command line with --project, use those instead of config's files
+		if len(commandLine.FileNames()) != 0 {
+			configForCompilation = configParseResult.WithFileNames(commandLine.FileNames())
+		}
 		// Updater to reflect pretty
 		reportDiagnostic = tsc.CreateDiagnosticReporter(sys, sys.Writer(), locale, commandLine.CompilerOptions())
 	}

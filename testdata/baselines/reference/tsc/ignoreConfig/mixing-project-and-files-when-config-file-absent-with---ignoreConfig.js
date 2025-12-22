@@ -11,5 +11,5 @@ export const b = 10;
 tsgo -p . src/a.ts c.ts --ignoreConfig
 ExitStatus:: DiagnosticsPresent_OutputsSkipped
 Output::
-[91merror[0m[90m TS5042: [0mOption 'project' cannot be mixed with source files on a command line.
+[91merror[0m[90m TS5081: [0mCannot find a tsconfig.json file at the current directory: /home/src/workspaces/project/tsconfig.json.
 
