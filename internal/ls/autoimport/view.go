@@ -14,15 +14,17 @@ import (
 	"github.com/microsoft/typescript-go/internal/lsp/lsproto"
 	"github.com/microsoft/typescript-go/internal/module"
 	"github.com/microsoft/typescript-go/internal/modulespecifiers"
+	"github.com/microsoft/typescript-go/internal/scanner"
 	"github.com/microsoft/typescript-go/internal/tspath"
 )
 
 type View struct {
-	registry      *Registry
-	importingFile *ast.SourceFile
-	program       *compiler.Program
-	preferences   modulespecifiers.UserPreferences
-	projectKey    tspath.Path
+	registry          *Registry
+	importingFile     *ast.SourceFile
+	importingFilePath tspath.Path
+	program           *compiler.Program
+	preferences       modulespecifiers.UserPreferences
+	projectKey        tspath.Path
 
 	allowedEndings                   []modulespecifiers.ModuleSpecifierEnding
 	conditions                       *collections.Set[string]
@@ -32,12 +34,17 @@ type View struct {
 }
 
 func NewView(registry *Registry, importingFile *ast.SourceFile, projectKey tspath.Path, program *compiler.Program, preferences modulespecifiers.UserPreferences) *View {
+	importingFilePath := importingFile.Path()
+	if canonical := importingFile.CanonicalSourceFile(); canonical != nil {
+		importingFilePath = canonical.Path()
+	}
 	return &View{
-		registry:      registry,
-		importingFile: importingFile,
-		program:       program,
-		projectKey:    projectKey,
-		preferences:   preferences,
+		registry:          registry,
+		importingFile:     importingFile,
+		importingFilePath: importingFilePath,
+		program:           program,
+		projectKey:        projectKey,
+		preferences:       preferences,
 		conditions: collections.NewSetFromItems(
 			module.GetConditions(program.Options(),
 				program.GetDefaultResolutionModeForFile(importingFile))...,
@@ -180,6 +187,9 @@ func (v *View) GetCompletions(ctx context.Context, prefix string, position lspro
 outer:
 	for _, e := range results {
 		name := e.Name()
+		if !scanner.IsIdentifierText(name, core.LanguageVariantStandard) {
+			continue
+		}
 		if forJSX && !(unicode.IsUpper(rune(name[0])) || e.IsRenameable()) {
 			continue
 		}

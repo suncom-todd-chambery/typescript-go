@@ -506,6 +506,14 @@ func (c *EmitContext) ParseNode(node *ast.Node) *ast.Node {
 	return nil
 }
 
+func (c *EmitContext) IsFileLevelUniqueName(sourceFile *ast.SourceFile, name string, hasGlobalName func(string) bool) bool {
+	if hasGlobalName != nil && hasGlobalName(name) {
+		return false
+	}
+	sourceFile = c.MostOriginal(sourceFile.AsNode()).AsSourceFile()
+	return !sourceFile.HasIdentifier(name)
+}
+
 //
 // Emit-related Data
 //
@@ -516,6 +524,17 @@ const (
 	hasCommentRange emitNodeFlags = 1 << iota
 	hasSourceMapRange
 )
+
+type SnippetKind int
+
+const (
+	SnippetKindTabStop SnippetKind = iota
+)
+
+type SnippetElement struct {
+	Kind  SnippetKind
+	Order int
+}
 
 type SynthesizedComment struct {
 	Kind               ast.Kind
@@ -536,6 +555,7 @@ type emitNode struct {
 	leadingComments           []SynthesizedComment
 	trailingComments          []SynthesizedComment
 	typeNode                  *ast.TypeNode
+	snippetElement            *SnippetElement
 }
 
 // NOTE: This method is not guaranteed to be thread-safe
@@ -547,6 +567,10 @@ func (e *emitNode) copyFrom(source *emitNode) {
 	e.tokenSourceMapRanges = maps.Clone(source.tokenSourceMapRanges)
 	e.helpers = slices.Clone(source.helpers)
 	e.externalHelpersModuleName = source.externalHelpersModuleName
+	if source.snippetElement != nil {
+		snippetElement := *source.snippetElement
+		e.snippetElement = &snippetElement
+	}
 }
 
 func (c *EmitContext) EmitFlags(node *ast.Node) EmitFlags {
@@ -562,6 +586,17 @@ func (c *EmitContext) SetEmitFlags(node *ast.Node, flags EmitFlags) {
 
 func (c *EmitContext) AddEmitFlags(node *ast.Node, flags EmitFlags) {
 	c.emitNodes.Get(node).emitFlags |= flags
+}
+
+func (c *EmitContext) SnippetElement(node *ast.Node) *SnippetElement {
+	if emitNode := c.emitNodes.TryGet(node); emitNode != nil {
+		return emitNode.snippetElement
+	}
+	return nil
+}
+
+func (c *EmitContext) SetSnippetElement(node *ast.Node, snippetElement SnippetElement) {
+	c.emitNodes.Get(node).snippetElement = &snippetElement
 }
 
 // Gets the range to use for a node when emitting comments.
@@ -892,6 +927,19 @@ func (c *EmitContext) AddInitializationStatement(node *ast.Node) {
 	scope.initializationStatements = append(scope.initializationStatements, node)
 }
 
+func (c *EmitContext) ConvertToFunctionBlock(node *ast.Node, multiLine bool) *ast.Node {
+	if ast.IsBlock(node) {
+		return node
+	}
+	returnStatement := c.Factory.NewReturnStatement(node)
+	returnStatement.Loc = node.Loc
+	statements := c.Factory.NewNodeList([]*ast.Node{returnStatement})
+	statements.Loc = node.Loc
+	block := c.Factory.NewBlock(statements, multiLine)
+	block.Loc = node.Loc
+	return block
+}
+
 func (c *EmitContext) VisitFunctionBody(node *ast.BlockOrExpression, visitor *ast.NodeVisitor) *ast.BlockOrExpression {
 	// !!! c.resumeVariableEnvironment()
 	updated := visitor.VisitNode(node)
@@ -905,8 +953,13 @@ func (c *EmitContext) VisitFunctionBody(node *ast.BlockOrExpression, visitor *as
 	}
 
 	if !ast.IsBlock(updated) {
-		statements := c.MergeEnvironment([]*ast.Statement{c.Factory.NewReturnStatement(updated)}, declarations)
-		return c.Factory.NewBlock(c.Factory.NewNodeList(statements), false /*multiLine*/)
+		c.AddEmitFlags(updated, EFNoComments)
+		block := c.ConvertToFunctionBlock(updated, false /*multiLine*/)
+		return c.Factory.UpdateBlock(
+			block.AsBlock(),
+			c.MergeEnvironmentList(block.StatementList(), declarations),
+			block.AsBlock().MultiLine,
+		)
 	}
 
 	return c.Factory.UpdateBlock(
@@ -943,11 +996,11 @@ func (c *EmitContext) VisitIterationBody(body *ast.Statement, visitor *ast.NodeV
 }
 
 func (c *EmitContext) VisitEmbeddedStatement(node *ast.Statement, visitor *ast.NodeVisitor) *ast.Statement {
-	embeddedStatement := visitor.VisitEmbeddedStatement(node)
-	if embeddedStatement == nil {
+	if node == nil {
 		return nil
 	}
-	if ast.IsNotEmittedStatement(embeddedStatement) {
+	embeddedStatement := visitor.VisitEmbeddedStatement(node)
+	if embeddedStatement == nil || ast.IsNotEmittedStatement(embeddedStatement) {
 		emptyStatement := visitor.Factory.NewEmptyStatement()
 		emptyStatement.Loc = node.Loc
 		c.SetOriginal(emptyStatement, node)

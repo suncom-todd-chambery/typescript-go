@@ -27,13 +27,16 @@ var (
 )
 
 func comparePathsByRedirect(a ModulePath, b ModulePath, useCaseSensitiveFileNames bool) int {
-	if a.IsRedirect == b.IsRedirect {
-		return tspath.ComparePaths(a.FileName, b.FileName, tspath.ComparePathsOptions{UseCaseSensitiveFileNames: useCaseSensitiveFileNames})
+	// Redirects sort first, matching Strada's compareBooleans(b.isRedirect, a.isRedirect).
+	if c := core.CompareBooleans(b.IsRedirect, a.IsRedirect); c != 0 {
+		return c
 	}
-	if a.IsRedirect {
-		return 1
+	if c := tspath.CompareNumberOfDirectorySeparators(a.FileName, b.FileName); c != 0 {
+		return c
 	}
-	return -1
+	// Strada relies on Map insertion order to break remaining ties deterministically;
+	// Go maps are unordered, so compare paths to keep the ordering stable.
+	return tspath.ComparePaths(a.FileName, b.FileName, tspath.ComparePathsOptions{UseCaseSensitiveFileNames: useCaseSensitiveFileNames})
 }
 
 func PathIsBareSpecifier(path string) bool {
@@ -195,18 +198,7 @@ func tryGetAnyFileFromPath(host ModuleSpecifierGenerationHost, path string) bool
 		&core.CompilerOptions{
 			AllowJs: core.TSTrue,
 		},
-		[]tsoptions.FileExtensionInfo{
-			{
-				Extension:      "node",
-				IsMixedContent: false,
-				ScriptKind:     core.ScriptKindExternal,
-			},
-			{
-				Extension:      "json",
-				IsMixedContent: false,
-				ScriptKind:     core.ScriptKindJSON,
-			},
-		},
+		[]string{".node", ".json"},
 	)
 	for _, exts := range extGroups {
 		for _, e := range exts {

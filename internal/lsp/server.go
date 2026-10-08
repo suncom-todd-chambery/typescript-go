@@ -16,8 +16,12 @@ import (
 
 	"github.com/microsoft/typescript-go/internal/api"
 	"github.com/microsoft/typescript-go/internal/collections"
+	"github.com/microsoft/typescript-go/internal/compiler"
+	"github.com/microsoft/typescript-go/internal/contentmapper"
 	"github.com/microsoft/typescript-go/internal/core"
 	"github.com/microsoft/typescript-go/internal/diagnostics"
+	"github.com/microsoft/typescript-go/internal/fswatch"
+	"github.com/microsoft/typescript-go/internal/ipc"
 	"github.com/microsoft/typescript-go/internal/json"
 	"github.com/microsoft/typescript-go/internal/jsonrpc"
 	"github.com/microsoft/typescript-go/internal/locale"
@@ -25,9 +29,11 @@ import (
 	"github.com/microsoft/typescript-go/internal/ls/lsconv"
 	"github.com/microsoft/typescript-go/internal/ls/lsutil"
 	"github.com/microsoft/typescript-go/internal/lsp/lsproto"
+	"github.com/microsoft/typescript-go/internal/lsp/lspwatcher"
 	"github.com/microsoft/typescript-go/internal/pprof"
 	"github.com/microsoft/typescript-go/internal/project"
 	"github.com/microsoft/typescript-go/internal/project/ata"
+	"github.com/microsoft/typescript-go/internal/tsoptions"
 	"github.com/microsoft/typescript-go/internal/tspath"
 	"github.com/microsoft/typescript-go/internal/vfs"
 	"golang.org/x/sync/errgroup"
@@ -44,7 +50,11 @@ type ServerOptions struct {
 	TypingsLocation    string
 	ParseCache         *project.ParseCache
 	NpmInstall         func(cwd string, args []string) ([]byte, error)
+	// Spawn launches a child process, returning its stdio as an io.ReadWriteCloser (Read is its stdout,
+	// Write is its stdin). It is nil when the host cannot spawn processes. Currently used for content mappers.
+	Spawn              func(command []string, dir string, stderr io.Writer) (io.ReadWriteCloser, error)
 	ProgressDelay      time.Duration // delay before showing progress UI; 0 means no delay
+	SetParentProcessID func(parentPID int)
 }
 
 func NewServer(opts *ServerOptions) *Server {
@@ -56,8 +66,8 @@ func NewServer(opts *ServerOptions) *Server {
 		r:                     opts.In,
 		w:                     opts.Out,
 		stderr:                opts.Err,
-		requestQueue:          make(chan *lsproto.RequestMessage, 100),
-		outgoingQueue:         make(chan *lsproto.Message, 100),
+		requestQueue:          newDynamicQueue[*lsproto.RequestMessage](),
+		outgoingQueue:         newDynamicQueue[*lsproto.Message](),
 		pendingClientRequests: make(map[jsonrpc.ID]pendingClientRequest),
 		pendingServerRequests: make(map[jsonrpc.ID]chan *lsproto.ResponseMessage),
 		cwd:                   opts.Cwd,
@@ -66,6 +76,8 @@ func NewServer(opts *ServerOptions) *Server {
 		typingsLocation:       opts.TypingsLocation,
 		parseCache:            opts.ParseCache,
 		npmInstall:            opts.NpmInstall,
+		spawn:                 opts.Spawn,
+		startWatchdog:         opts.SetParentProcessID,
 		initComplete:          make(chan struct{}),
 		progressDelay:         opts.ProgressDelay,
 	}
@@ -108,6 +120,16 @@ type lspWriter struct {
 	w *lsproto.BaseWriter
 }
 
+type messageMarshalError struct {
+	err error
+}
+
+func (e *messageMarshalError) Error() string { return "failed to marshal message: " + e.err.Error() }
+
+func (e *messageMarshalError) Unwrap() []error {
+	return []error{lsproto.ErrorCodeInternalError, e.err}
+}
+
 func (r *lspReader) Read() (*lsproto.Message, error) {
 	data, err := r.r.Read()
 	if err != nil {
@@ -132,7 +154,7 @@ func ToReader(r io.Reader) Reader {
 func (w *lspWriter) Write(msg *lsproto.Message) error {
 	data, err := json.Marshal(msg)
 	if err != nil {
-		return fmt.Errorf("failed to marshal message: %w", err)
+		return &messageMarshalError{err: err}
 	}
 	return w.w.Write(data)
 }
@@ -156,8 +178,8 @@ type Server struct {
 	logger                  *logger
 	initStarted             atomic.Bool
 	clientSeq               atomic.Int32
-	requestQueue            chan *lsproto.RequestMessage
-	outgoingQueue           chan *lsproto.Message
+	requestQueue            *dynamicQueue[*lsproto.RequestMessage]
+	outgoingQueue           *dynamicQueue[*lsproto.Message]
 	pendingClientRequests   map[jsonrpc.ID]pendingClientRequest
 	pendingClientRequestsMu sync.Mutex
 	pendingServerRequests   map[jsonrpc.ID]chan *lsproto.ResponseMessage
@@ -168,15 +190,34 @@ type Server struct {
 	defaultLibraryPath string
 	typingsLocation    string
 
-	initializeParams   *lsproto.InitializeParams
-	clientCapabilities lsproto.ResolvedClientCapabilities
-	positionEncoding   lsproto.PositionEncodingKind
-	locale             locale.Locale
+	initializeParams      *lsproto.InitializeParams
+	initializationOptions *lsproto.InitializationOptions
+	clientCapabilities    lsproto.ResolvedClientCapabilities
+	positionEncoding      lsproto.PositionEncodingKind
+	localeMu              sync.RWMutex
+	locale                locale.Locale
+	// initLocale is the locale resolved from the initialize request; it is
+	// used as the fallback when the user's locale preference is "auto".
+	initLocale locale.Locale
 
 	watchEnabled     bool
 	telemetryEnabled bool
 	watcherID        atomic.Uint32
 	watchers         collections.SyncSet[project.WatcherID]
+
+	// contentMapperRegistrationMu serializes RegisterContentMapperExtensions so the method is correctly
+	// synchronized on its own rather than relying on callers to serialize it. It guards
+	// contentMapperExtensionsRegistered and the ordered unregister/register requests the method sends.
+	contentMapperRegistrationMu sync.Mutex
+	// contentMapperExtensionsRegistered records whether a content mapper text document sync
+	// registration is currently active with the client, so it can be replaced or removed.
+	contentMapperExtensionsRegistered bool
+	// builtinWatcher is non-nil when the server is running its own
+	// in-process file watcher instead of using LSP-based watching. It
+	// is enabled when the client lacks DynamicRegistration for
+	// workspace/didChangeWatchedFiles and the builtin watcher backend
+	// supports efficient recursive watching (Windows or FSEvents).
+	builtinWatcher *lspwatcher.Watcher
 
 	lastRequestTimeMs atomic.Int64
 
@@ -199,11 +240,16 @@ type Server struct {
 	parseCache *project.ParseCache
 
 	npmInstall func(cwd string, args []string) ([]byte, error)
+	spawn      func(command []string, dir string, stderr io.Writer) (io.ReadWriteCloser, error)
 
 	cpuProfiler pprof.CPUProfiler
 
 	progressDelay   time.Duration
 	projectProgress *projectLoadingProgress
+
+	startWatchdog func(parentPID int)
+
+	flakeLogging lsproto.DiagnosticFlakeLogLevel
 }
 
 func (s *Server) Session() *project.Session { return s.session }
@@ -215,6 +261,13 @@ func (s *Server) InitComplete() <-chan struct{} { return s.initComplete }
 
 // WatchFiles implements project.Client.
 func (s *Server) WatchFiles(ctx context.Context, id project.WatcherID, watchers []*lsproto.FileSystemWatcher) error {
+	if s.builtinWatcher != nil {
+		if err := s.builtinWatcher.WatchFiles(string(id), watchers); err != nil {
+			return fmt.Errorf("failed to register file watcher: %w", err)
+		}
+		s.watchers.Add(id)
+		return nil
+	}
 	_, err := sendClientRequest(ctx, s, lsproto.ClientRegisterCapabilityInfo, &lsproto.RegistrationParams{
 		Registrations: []*lsproto.Registration{
 			{
@@ -237,6 +290,16 @@ func (s *Server) WatchFiles(ctx context.Context, id project.WatcherID, watchers 
 
 // UnwatchFiles implements project.Client.
 func (s *Server) UnwatchFiles(ctx context.Context, id project.WatcherID) error {
+	if s.builtinWatcher != nil {
+		if !s.watchers.Has(id) {
+			return fmt.Errorf("no file watcher exists with ID %s", id)
+		}
+		if err := s.builtinWatcher.UnwatchFiles(string(id)); err != nil {
+			return fmt.Errorf("failed to unregister file watcher: %w", err)
+		}
+		s.watchers.Delete(id)
+		return nil
+	}
 	if s.watchers.Has(id) {
 		_, err := sendClientRequest(ctx, s, lsproto.ClientUnregisterCapabilityInfo, &lsproto.UnregistrationParams{
 			Unregisterations: []*lsproto.Unregistration{
@@ -257,13 +320,397 @@ func (s *Server) UnwatchFiles(ctx context.Context, id project.WatcherID) error {
 	return fmt.Errorf("no file watcher exists with ID %s", id)
 }
 
+const (
+	contentMapperDidOpenRegistrationID           = "content-mapper-did-open"
+	contentMapperDidChangeRegistrationID         = "content-mapper-did-change"
+	contentMapperDidCloseRegistrationID          = "content-mapper-did-close"
+	contentMapperDiagnosticRegistrationID        = "content-mapper-diagnostic"
+	contentMapperHoverRegistrationID             = "content-mapper-hover"
+	contentMapperSignatureHelpRegistrationID     = "content-mapper-signature-help"
+	contentMapperDefinitionRegistrationID        = "content-mapper-definition"
+	contentMapperTypeDefinitionRegistrationID    = "content-mapper-type-definition"
+	contentMapperImplementationRegistrationID    = "content-mapper-implementation"
+	contentMapperReferencesRegistrationID        = "content-mapper-references"
+	contentMapperDocumentHighlightRegistrationID = "content-mapper-document-highlight"
+	contentMapperCompletionRegistrationID        = "content-mapper-completion"
+	contentMapperRenameRegistrationID            = "content-mapper-rename"
+	contentMapperSemanticTokensRegistrationID    = "content-mapper-semantic-tokens"
+	contentMapperDocumentSymbolRegistrationID    = "content-mapper-document-symbol"
+	contentMapperFoldingRangeRegistrationID      = "content-mapper-folding-range"
+	contentMapperSelectionRangeRegistrationID    = "content-mapper-selection-range"
+	contentMapperInlayHintRegistrationID         = "content-mapper-inlay-hint"
+	contentMapperCodeLensRegistrationID          = "content-mapper-code-lens"
+	contentMapperCodeActionRegistrationID        = "content-mapper-code-action"
+	contentMapperFormattingRegistrationID        = "content-mapper-formatting"
+	contentMapperRangeFormattingRegistrationID   = "content-mapper-range-formatting"
+	contentMapperOnTypeFormattingRegistrationID  = "content-mapper-on-type-formatting"
+	contentMapperLinkedEditingRegistrationID     = "content-mapper-linked-editing"
+	contentMapperCallHierarchyRegistrationID     = "content-mapper-call-hierarchy"
+	contentMapperWillRenameFilesRegistrationID   = "content-mapper-will-rename-files"
+)
+
+func (s *Server) supportsContentMapperRegistration(id string) bool {
+	switch id {
+	case contentMapperDidOpenRegistrationID, contentMapperDidChangeRegistrationID, contentMapperDidCloseRegistrationID:
+		return s.clientCapabilities.TextDocument.Synchronization.DynamicRegistration
+	case contentMapperDiagnosticRegistrationID:
+		return s.clientCapabilities.TextDocument.Diagnostic.DynamicRegistration
+	case contentMapperHoverRegistrationID:
+		return s.clientCapabilities.TextDocument.Hover.DynamicRegistration
+	case contentMapperSignatureHelpRegistrationID:
+		return s.clientCapabilities.TextDocument.SignatureHelp.DynamicRegistration
+	case contentMapperDefinitionRegistrationID:
+		return s.clientCapabilities.TextDocument.Definition.DynamicRegistration
+	case contentMapperTypeDefinitionRegistrationID:
+		return s.clientCapabilities.TextDocument.TypeDefinition.DynamicRegistration
+	case contentMapperImplementationRegistrationID:
+		return s.clientCapabilities.TextDocument.Implementation.DynamicRegistration
+	case contentMapperReferencesRegistrationID:
+		return s.clientCapabilities.TextDocument.References.DynamicRegistration
+	case contentMapperDocumentHighlightRegistrationID:
+		return s.clientCapabilities.TextDocument.DocumentHighlight.DynamicRegistration
+	case contentMapperCompletionRegistrationID:
+		return s.clientCapabilities.TextDocument.Completion.DynamicRegistration
+	case contentMapperRenameRegistrationID:
+		return s.clientCapabilities.TextDocument.Rename.DynamicRegistration
+	case contentMapperSemanticTokensRegistrationID:
+		return s.clientCapabilities.TextDocument.SemanticTokens.DynamicRegistration
+	case contentMapperDocumentSymbolRegistrationID:
+		return s.clientCapabilities.TextDocument.DocumentSymbol.DynamicRegistration
+	case contentMapperFoldingRangeRegistrationID:
+		return s.clientCapabilities.TextDocument.FoldingRange.DynamicRegistration
+	case contentMapperSelectionRangeRegistrationID:
+		return s.clientCapabilities.TextDocument.SelectionRange.DynamicRegistration
+	case contentMapperInlayHintRegistrationID:
+		return s.clientCapabilities.TextDocument.InlayHint.DynamicRegistration
+	case contentMapperCodeLensRegistrationID:
+		return s.clientCapabilities.TextDocument.CodeLens.DynamicRegistration
+	case contentMapperCodeActionRegistrationID:
+		return s.clientCapabilities.TextDocument.CodeAction.DynamicRegistration
+	case contentMapperFormattingRegistrationID:
+		return s.clientCapabilities.TextDocument.Formatting.DynamicRegistration
+	case contentMapperRangeFormattingRegistrationID:
+		return s.clientCapabilities.TextDocument.RangeFormatting.DynamicRegistration
+	case contentMapperOnTypeFormattingRegistrationID:
+		return s.clientCapabilities.TextDocument.OnTypeFormatting.DynamicRegistration
+	case contentMapperLinkedEditingRegistrationID:
+		return s.clientCapabilities.TextDocument.LinkedEditingRange.DynamicRegistration
+	case contentMapperCallHierarchyRegistrationID:
+		return s.clientCapabilities.TextDocument.CallHierarchy.DynamicRegistration
+	case contentMapperWillRenameFilesRegistrationID:
+		return s.clientCapabilities.Workspace.FileOperations.DynamicRegistration &&
+			s.clientCapabilities.Workspace.FileOperations.WillRename
+	default:
+		return false
+	}
+}
+
+// RegisterContentMapperExtensions implements project.Client. It dynamically registers text document
+// synchronization and pull diagnostics for the given otherwise unsupported file extensions so the editor forwards their
+// open/change/close notifications to the server and requests diagnostics for them. It is called with the
+// full desired set each time it changes; an empty slice removes any prior registration.
+func (s *Server) RegisterContentMapperExtensions(ctx context.Context, extensions []string) error {
+	if !s.clientCapabilities.TextDocument.Synchronization.DynamicRegistration {
+		return nil
+	}
+
+	s.contentMapperRegistrationMu.Lock()
+	defer s.contentMapperRegistrationMu.Unlock()
+
+	if s.contentMapperExtensionsRegistered {
+		unregistrations := []*lsproto.Unregistration{
+			{Id: contentMapperDidOpenRegistrationID, Method: string(lsproto.MethodTextDocumentDidOpen)},
+			{Id: contentMapperDidChangeRegistrationID, Method: string(lsproto.MethodTextDocumentDidChange)},
+			{Id: contentMapperDidCloseRegistrationID, Method: string(lsproto.MethodTextDocumentDidClose)},
+			{Id: contentMapperDiagnosticRegistrationID, Method: string(lsproto.MethodTextDocumentDiagnostic)},
+			{Id: contentMapperHoverRegistrationID, Method: string(lsproto.MethodTextDocumentHover)},
+			{Id: contentMapperSignatureHelpRegistrationID, Method: string(lsproto.MethodTextDocumentSignatureHelp)},
+			{Id: contentMapperDefinitionRegistrationID, Method: string(lsproto.MethodTextDocumentDefinition)},
+			{Id: contentMapperTypeDefinitionRegistrationID, Method: string(lsproto.MethodTextDocumentTypeDefinition)},
+			{Id: contentMapperImplementationRegistrationID, Method: string(lsproto.MethodTextDocumentImplementation)},
+			{Id: contentMapperReferencesRegistrationID, Method: string(lsproto.MethodTextDocumentReferences)},
+			{Id: contentMapperDocumentHighlightRegistrationID, Method: string(lsproto.MethodTextDocumentDocumentHighlight)},
+			{Id: contentMapperCompletionRegistrationID, Method: string(lsproto.MethodTextDocumentCompletion)},
+			{Id: contentMapperRenameRegistrationID, Method: string(lsproto.MethodTextDocumentRename)},
+			{Id: contentMapperSemanticTokensRegistrationID, Method: string(lsproto.MethodTextDocumentSemanticTokens)},
+			{Id: contentMapperDocumentSymbolRegistrationID, Method: string(lsproto.MethodTextDocumentDocumentSymbol)},
+			{Id: contentMapperFoldingRangeRegistrationID, Method: string(lsproto.MethodTextDocumentFoldingRange)},
+			{Id: contentMapperSelectionRangeRegistrationID, Method: string(lsproto.MethodTextDocumentSelectionRange)},
+			{Id: contentMapperInlayHintRegistrationID, Method: string(lsproto.MethodTextDocumentInlayHint)},
+			{Id: contentMapperCodeLensRegistrationID, Method: string(lsproto.MethodTextDocumentCodeLens)},
+			{Id: contentMapperCodeActionRegistrationID, Method: string(lsproto.MethodTextDocumentCodeAction)},
+			{Id: contentMapperFormattingRegistrationID, Method: string(lsproto.MethodTextDocumentFormatting)},
+			{Id: contentMapperRangeFormattingRegistrationID, Method: string(lsproto.MethodTextDocumentRangeFormatting)},
+			{Id: contentMapperOnTypeFormattingRegistrationID, Method: string(lsproto.MethodTextDocumentOnTypeFormatting)},
+			{Id: contentMapperLinkedEditingRegistrationID, Method: string(lsproto.MethodTextDocumentLinkedEditingRange)},
+			{Id: contentMapperCallHierarchyRegistrationID, Method: string(lsproto.MethodTextDocumentPrepareCallHierarchy)},
+			{Id: contentMapperWillRenameFilesRegistrationID, Method: string(lsproto.MethodWorkspaceWillRenameFiles)},
+		}
+		unregistrations = slices.DeleteFunc(unregistrations, func(registration *lsproto.Unregistration) bool {
+			return !s.supportsContentMapperRegistration(registration.Id)
+		})
+		if _, err := sendClientRequest(ctx, s, lsproto.ClientUnregisterCapabilityInfo, &lsproto.UnregistrationParams{
+			Unregisterations: unregistrations,
+		}); err != nil {
+			return fmt.Errorf("failed to unregister content mapper text document sync: %w", err)
+		}
+		s.contentMapperExtensionsRegistered = false
+	}
+
+	if len(extensions) == 0 {
+		return nil
+	}
+
+	filters := make([]lsproto.TextDocumentFilterLanguageOrSchemeOrPattern, 0, len(extensions))
+	for _, ext := range extensions {
+		filters = append(filters, lsproto.TextDocumentFilterLanguageOrSchemeOrPattern{
+			Pattern: &lsproto.TextDocumentFilterPattern{
+				Pattern: lsproto.PatternOrRelativePattern{Pattern: new("**/*" + ext)},
+			},
+		})
+	}
+	selector := lsproto.DocumentSelectorOrNull{DocumentSelector: &filters}
+	contentMapperFileRenameFilters := make([]*lsproto.FileOperationFilter, 0, len(extensions))
+	for _, extension := range extensions {
+		contentMapperFileRenameFilters = append(contentMapperFileRenameFilters, &lsproto.FileOperationFilter{
+			Scheme: new("file"),
+			Pattern: &lsproto.FileOperationPattern{
+				Glob: "**/*" + extension,
+			},
+		})
+	}
+
+	registrations := []*lsproto.Registration{
+		{
+			Id: contentMapperDidOpenRegistrationID,
+			RegisterOptions: &lsproto.RegisterOptions{
+				TextDocumentDidOpen: &lsproto.TextDocumentRegistrationOptions{DocumentSelector: selector},
+			},
+		},
+		{
+			Id: contentMapperDidChangeRegistrationID,
+			RegisterOptions: &lsproto.RegisterOptions{
+				TextDocumentDidChange: &lsproto.TextDocumentChangeRegistrationOptions{
+					DocumentSelector: selector,
+					SyncKind:         lsproto.TextDocumentSyncKindIncremental,
+				},
+			},
+		},
+		{
+			Id: contentMapperDidCloseRegistrationID,
+			RegisterOptions: &lsproto.RegisterOptions{
+				TextDocumentDidClose: &lsproto.TextDocumentRegistrationOptions{DocumentSelector: selector},
+			},
+		},
+		{
+			Id: contentMapperDiagnosticRegistrationID,
+			RegisterOptions: &lsproto.RegisterOptions{
+				TextDocumentDiagnostic: &lsproto.DiagnosticRegistrationOptions{
+					DocumentSelector:      selector,
+					Identifier:            new("typescript"),
+					InterFileDependencies: true,
+				},
+			},
+		},
+		{
+			Id: contentMapperHoverRegistrationID,
+			RegisterOptions: &lsproto.RegisterOptions{
+				TextDocumentHover: &lsproto.HoverRegistrationOptions{DocumentSelector: selector},
+			},
+		},
+		{
+			Id: contentMapperSignatureHelpRegistrationID,
+			RegisterOptions: &lsproto.RegisterOptions{
+				TextDocumentSignatureHelp: &lsproto.SignatureHelpRegistrationOptions{
+					DocumentSelector:    selector,
+					TriggerCharacters:   &ls.SignatureHelpTriggerCharacters,
+					RetriggerCharacters: &ls.SignatureHelpRetriggerCharacters,
+				},
+			},
+		},
+		{
+			Id: contentMapperDefinitionRegistrationID,
+			RegisterOptions: &lsproto.RegisterOptions{
+				TextDocumentDefinition: &lsproto.DefinitionRegistrationOptions{DocumentSelector: selector},
+			},
+		},
+		{
+			Id: contentMapperTypeDefinitionRegistrationID,
+			RegisterOptions: &lsproto.RegisterOptions{
+				TextDocumentTypeDefinition: &lsproto.TypeDefinitionRegistrationOptions{DocumentSelector: selector},
+			},
+		},
+		{
+			Id: contentMapperImplementationRegistrationID,
+			RegisterOptions: &lsproto.RegisterOptions{
+				TextDocumentImplementation: &lsproto.ImplementationRegistrationOptions{DocumentSelector: selector},
+			},
+		},
+		{
+			Id: contentMapperReferencesRegistrationID,
+			RegisterOptions: &lsproto.RegisterOptions{
+				TextDocumentReferences: &lsproto.ReferenceRegistrationOptions{DocumentSelector: selector},
+			},
+		},
+		{
+			Id: contentMapperDocumentHighlightRegistrationID,
+			RegisterOptions: &lsproto.RegisterOptions{
+				TextDocumentDocumentHighlight: &lsproto.DocumentHighlightRegistrationOptions{DocumentSelector: selector},
+			},
+		},
+		{
+			Id: contentMapperCompletionRegistrationID,
+			RegisterOptions: &lsproto.RegisterOptions{
+				TextDocumentCompletion: &lsproto.CompletionRegistrationOptions{
+					DocumentSelector:  selector,
+					TriggerCharacters: &ls.CompletionTriggerCharacters,
+					ResolveProvider:   new(true),
+					CompletionItem: &lsproto.ServerCompletionItemOptions{
+						LabelDetailsSupport: new(true),
+					},
+				},
+			},
+		},
+		{
+			Id: contentMapperRenameRegistrationID,
+			RegisterOptions: &lsproto.RegisterOptions{
+				TextDocumentRename: &lsproto.RenameRegistrationOptions{
+					DocumentSelector: selector,
+					PrepareProvider:  new(true),
+				},
+			},
+		},
+		{
+			Id: contentMapperSemanticTokensRegistrationID,
+			RegisterOptions: &lsproto.RegisterOptions{
+				TextDocumentSemanticTokens: &lsproto.SemanticTokensRegistrationOptions{
+					DocumentSelector: selector,
+					Legend:           ls.SemanticTokensLegend(s.clientCapabilities.TextDocument.SemanticTokens),
+					Full: &lsproto.BooleanOrSemanticTokensFullDelta{
+						Boolean: new(true),
+					},
+					Range: &lsproto.BooleanOrEmptyObject{
+						Boolean: new(true),
+					},
+				},
+			},
+		},
+		{
+			Id: contentMapperDocumentSymbolRegistrationID,
+			RegisterOptions: &lsproto.RegisterOptions{
+				TextDocumentDocumentSymbol: &lsproto.DocumentSymbolRegistrationOptions{DocumentSelector: selector},
+			},
+		},
+		{
+			Id: contentMapperFoldingRangeRegistrationID,
+			RegisterOptions: &lsproto.RegisterOptions{
+				TextDocumentFoldingRange: &lsproto.FoldingRangeRegistrationOptions{DocumentSelector: selector},
+			},
+		},
+		{
+			Id: contentMapperSelectionRangeRegistrationID,
+			RegisterOptions: &lsproto.RegisterOptions{
+				TextDocumentSelectionRange: &lsproto.SelectionRangeRegistrationOptions{DocumentSelector: selector},
+			},
+		},
+		{
+			Id: contentMapperInlayHintRegistrationID,
+			RegisterOptions: &lsproto.RegisterOptions{
+				TextDocumentInlayHint: &lsproto.InlayHintRegistrationOptions{DocumentSelector: selector},
+			},
+		},
+		{
+			Id: contentMapperCodeLensRegistrationID,
+			RegisterOptions: &lsproto.RegisterOptions{
+				TextDocumentCodeLens: &lsproto.CodeLensRegistrationOptions{
+					DocumentSelector: selector,
+					ResolveProvider:  new(true),
+				},
+			},
+		},
+		{
+			Id: contentMapperCodeActionRegistrationID,
+			RegisterOptions: &lsproto.RegisterOptions{
+				TextDocumentCodeAction: &lsproto.CodeActionRegistrationOptions{
+					DocumentSelector: selector,
+					CodeActionKinds: &[]lsproto.CodeActionKind{
+						lsproto.CodeActionKindQuickFix,
+						lsproto.CodeActionKindSourceOrganizeImports,
+						lsproto.CodeActionKindSourceRemoveUnusedImports,
+						lsproto.CodeActionKindSourceSortImports,
+						lsproto.CodeActionKindSourceFixAll,
+					},
+				},
+			},
+		},
+		{
+			Id: contentMapperFormattingRegistrationID,
+			RegisterOptions: &lsproto.RegisterOptions{
+				TextDocumentFormatting: &lsproto.DocumentFormattingRegistrationOptions{DocumentSelector: selector},
+			},
+		},
+		{
+			Id: contentMapperRangeFormattingRegistrationID,
+			RegisterOptions: &lsproto.RegisterOptions{
+				TextDocumentRangeFormatting: &lsproto.DocumentRangeFormattingRegistrationOptions{DocumentSelector: selector},
+			},
+		},
+		{
+			Id: contentMapperOnTypeFormattingRegistrationID,
+			RegisterOptions: &lsproto.RegisterOptions{
+				TextDocumentOnTypeFormatting: &lsproto.DocumentOnTypeFormattingRegistrationOptions{
+					DocumentSelector:      selector,
+					FirstTriggerCharacter: "{",
+					MoreTriggerCharacter:  &[]string{"}", ";", "\n"},
+				},
+			},
+		},
+		{
+			Id: contentMapperLinkedEditingRegistrationID,
+			RegisterOptions: &lsproto.RegisterOptions{
+				TextDocumentLinkedEditingRange: &lsproto.LinkedEditingRangeRegistrationOptions{DocumentSelector: selector},
+			},
+		},
+		{
+			Id: contentMapperCallHierarchyRegistrationID,
+			RegisterOptions: &lsproto.RegisterOptions{
+				TextDocumentPrepareCallHierarchy: &lsproto.CallHierarchyRegistrationOptions{DocumentSelector: selector},
+			},
+		},
+		{
+			Id: contentMapperWillRenameFilesRegistrationID,
+			RegisterOptions: &lsproto.RegisterOptions{
+				WorkspaceWillRenameFiles: &lsproto.FileOperationRegistrationOptions{Filters: contentMapperFileRenameFilters},
+			},
+		},
+	}
+	registrations = slices.DeleteFunc(registrations, func(registration *lsproto.Registration) bool {
+		return !s.supportsContentMapperRegistration(registration.Id)
+	})
+	if _, err := sendClientRequest(ctx, s, lsproto.ClientRegisterCapabilityInfo, &lsproto.RegistrationParams{
+		Registrations: registrations,
+	}); err != nil {
+		return fmt.Errorf("failed to register content mapper text document sync: %w", err)
+	}
+
+	s.contentMapperExtensionsRegistered = true
+	return nil
+}
+
 // RefreshDiagnostics implements project.Client.
 func (s *Server) RefreshDiagnostics(ctx context.Context) error {
 	if !s.clientCapabilities.Workspace.Diagnostics.RefreshSupport {
 		return nil
 	}
 
-	if _, err := sendClientRequest(ctx, s, lsproto.WorkspaceDiagnosticRefreshInfo, lsproto.NoParams{}); err != nil {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	// Fire-and-forget: the client always returns null, and waiting for the response
+	// can cause the server to hang if the client is slow or unresponsive.
+	// Any response from the client will be silently ignored by the read loop.
+	if err := sendClientRequestFireAndForget(s, lsproto.WorkspaceDiagnosticRefreshInfo, lsproto.NoParams{}); err != nil {
 		return fmt.Errorf("failed to refresh diagnostics: %w", err)
 	}
 
@@ -294,7 +741,7 @@ func (s *Server) RefreshInlayHints(ctx context.Context) error {
 		return nil
 	}
 
-	if _, err := sendClientRequest(ctx, s, lsproto.WorkspaceInlayHintRefreshInfo, lsproto.NoParams{}); err != nil {
+	if err := sendClientRequestFireAndForget(s, lsproto.WorkspaceInlayHintRefreshInfo, lsproto.NoParams{}); err != nil {
 		return fmt.Errorf("failed to refresh inlay hints: %w", err)
 	}
 	return nil
@@ -305,7 +752,7 @@ func (s *Server) RefreshCodeLens(ctx context.Context) error {
 		return nil
 	}
 
-	if _, err := sendClientRequest(ctx, s, lsproto.WorkspaceCodeLensRefreshInfo, lsproto.NoParams{}); err != nil {
+	if err := sendClientRequestFireAndForget(s, lsproto.WorkspaceCodeLensRefreshInfo, lsproto.NoParams{}); err != nil {
 		return fmt.Errorf("failed to refresh code lens: %w", err)
 	}
 	return nil
@@ -325,16 +772,39 @@ func (s *Server) ProgressFinish(message *diagnostics.Message, args ...any) {
 	}
 }
 
+// GetLocale implements project.Client.
+func (s *Server) GetLocale() locale.Locale {
+	s.localeMu.RLock()
+	defer s.localeMu.RUnlock()
+	return s.locale
+}
+
+// SetLocale implements project.Client.
+func (s *Server) SetLocale(localeString string) {
+	newLocale := s.initLocale
+	if localeString != "auto" {
+		parsed, ok := locale.Parse(localeString)
+		if !ok {
+			return
+		}
+		newLocale = parsed
+	}
+	s.localeMu.Lock()
+	s.locale = newLocale
+	s.localeMu.Unlock()
+}
+
 func (s *Server) RequestConfiguration(ctx context.Context) (lsutil.UserPreferences, error) {
 	caps := lsproto.GetClientCapabilities(ctx)
 	if !caps.Workspace.Configuration {
-		if s.initializeParams != nil && s.initializeParams.InitializationOptions != nil && s.initializeParams.InitializationOptions.UserPreferences != nil {
+		if opts := s.initializationOptions; opts.UserPreferences != nil {
+			userPrefs := *opts.UserPreferences
 			s.logger.Logf(
 				"received formatting options from initialization: %T\n%+v",
-				*s.initializeParams.InitializationOptions.UserPreferences,
-				*s.initializeParams.InitializationOptions.UserPreferences,
+				userPrefs,
+				userPrefs,
 			)
-			if config, ok := (*s.initializeParams.InitializationOptions.UserPreferences).(map[string]any); ok {
+			if config, ok := userPrefs.(map[string]any); ok {
 				return lsutil.ParseUserPreferences(map[string]any{"js/ts": config}), nil
 			}
 		}
@@ -431,7 +901,14 @@ func (s *Server) readLoop(ctx context.Context) error {
 		if s.initializeParams == nil && msg.Kind == jsonrpc.MessageKindRequest {
 			req := msg.AsRequest()
 			if req.Method == lsproto.MethodInitialize {
-				resp, err := s.handleInitialize(ctx, req.Params.(*lsproto.InitializeParams), req)
+				params, err := lsproto.UnmarshalParams[*lsproto.InitializeParams](req)
+				if err != nil {
+					if err := s.sendError(req.ID, err); err != nil {
+						return err
+					}
+					continue
+				}
+				resp, err := s.handleInitialize(ctx, params, req)
 				if err != nil {
 					return err
 				}
@@ -458,9 +935,13 @@ func (s *Server) readLoop(ctx context.Context) error {
 		} else {
 			req := msg.AsRequest()
 			if req.Method == lsproto.MethodCancelRequest {
-				s.cancelRequest(req.Params.(*lsproto.CancelParams).Id)
+				if params, err := lsproto.UnmarshalParams[*lsproto.CancelParams](req); err == nil && params != nil {
+					s.cancelRequest(params.Id)
+				}
 			} else {
-				s.requestQueue <- req
+				if err := s.requestQueue.Put(ctx, req); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -484,76 +965,87 @@ func (s *Server) dispatchLoop(ctx context.Context) error {
 	ctx, lspExit := context.WithCancelCause(ctx)
 	defer lspExit(nil)
 	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case req := <-s.requestQueue:
-			s.lastRequestTimeMs.Store(time.Now().UnixMilli())
-			requestCtx := locale.WithLocale(ctx, s.locale)
-			var cancel context.CancelFunc
-			if req.ID != nil {
-				requestCtx, cancel = context.WithCancel(core.WithRequestID(requestCtx, req.ID.String()))
-				s.pendingClientRequestsMu.Lock()
-				s.pendingClientRequests[*req.ID] = pendingClientRequest{
-					req:    req,
-					cancel: cancel,
-				}
-				s.pendingClientRequestsMu.Unlock()
-			}
+		req, err := s.requestQueue.Get(ctx)
+		if err != nil {
+			return err
+		}
 
-			handleError := func(err error) {
-				if errors.Is(err, context.Canceled) {
-					if err := s.sendError(req.ID, lsproto.ErrorCodeRequestCancelled); err != nil {
-						lspExit(err)
-					}
-				} else if errors.Is(err, io.EOF) {
-					lspExit(nil)
-				} else {
-					if err := s.sendError(req.ID, err); err != nil {
-						lspExit(err)
-					}
-				}
+		s.lastRequestTimeMs.Store(time.Now().UnixMilli())
+		requestCtx := locale.WithLocale(ctx, s.GetLocale())
+		var cancel context.CancelFunc
+		if req.ID != nil {
+			requestCtx, cancel = context.WithCancel(core.WithRequestID(requestCtx, req.ID.String()))
+			s.pendingClientRequestsMu.Lock()
+			s.pendingClientRequests[*req.ID] = pendingClientRequest{
+				req:    req,
+				cancel: cancel,
 			}
+			s.pendingClientRequestsMu.Unlock()
+		}
 
-			removeRequest := func() {
-				if req.ID != nil {
-					defer cancel()
-					s.pendingClientRequestsMu.Lock()
-					defer s.pendingClientRequestsMu.Unlock()
-					delete(s.pendingClientRequests, *req.ID)
+		handleError := func(err error) {
+			if errors.Is(err, context.Canceled) {
+				if err := s.sendError(req.ID, lsproto.ErrorCodeRequestCancelled); err != nil {
+					lspExit(err)
 				}
-			}
-
-			if doAsyncWork, err := s.handleRequestOrNotification(requestCtx, req); err != nil {
-				handleError(err)
-				removeRequest()
-			} else if doAsyncWork != nil {
-				go func() {
-					if lsError := doAsyncWork(); lsError != nil {
-						handleError(lsError)
-					}
-					removeRequest()
-				}()
+			} else if errors.Is(err, io.EOF) {
+				lspExit(nil)
 			} else {
-				removeRequest()
+				if err := s.sendError(req.ID, err); err != nil {
+					lspExit(err)
+				}
 			}
+		}
+
+		removeRequest := func() {
+			if req.ID != nil {
+				defer cancel()
+				s.pendingClientRequestsMu.Lock()
+				defer s.pendingClientRequestsMu.Unlock()
+				delete(s.pendingClientRequests, *req.ID)
+			}
+		}
+
+		if doAsyncWork, err := s.handleRequestOrNotification(requestCtx, req); err != nil {
+			handleError(err)
+			removeRequest()
+		} else if doAsyncWork != nil {
+			go func() {
+				if lsError := doAsyncWork(); lsError != nil {
+					handleError(lsError)
+				}
+				removeRequest()
+			}()
+		} else {
+			removeRequest()
 		}
 	}
 }
 
 func (s *Server) writeLoop(ctx context.Context) error {
 	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case msg := <-s.outgoingQueue:
-			if err := s.w.Write(msg); err != nil {
-				return fmt.Errorf("failed to write message: %w", err)
+		msg, err := s.outgoingQueue.Get(ctx)
+		if err != nil {
+			return err
+		}
+		if err := s.w.Write(msg); err != nil {
+			var marshalErr *messageMarshalError
+			if errors.As(err, &marshalErr) && msg.Kind == jsonrpc.MessageKindResponse {
+				if resp := msg.AsResponse(); resp.ID != nil && resp.Error == nil {
+					s.logger.Errorf("failed to marshal response for request %s: %v", resp.ID, marshalErr)
+					if sendErr := s.sendError(resp.ID, marshalErr); sendErr != nil {
+						return sendErr
+					}
+					continue
+				}
 			}
+			return fmt.Errorf("failed to write message: %w", err)
 		}
 	}
 }
 
+// WARNING: this should only be called in the async portion of a request handler,
+// otherwise a deadlock can occur.
 func sendClientRequest[Req, Resp any](ctx context.Context, s *Server, info lsproto.RequestInfo[Req, Resp], params Req) (Resp, error) {
 	id := jsonrpc.NewIDString(fmt.Sprintf("ts%d", s.clientSeq.Add(1)))
 	req := info.NewRequestMessage(id, params)
@@ -585,6 +1077,16 @@ func sendClientRequest[Req, Resp any](ctx context.Context, s *Server, info lspro
 		}
 		return info.UnmarshalResult(resp.Result)
 	}
+}
+
+// sendClientRequestFireAndForget sends a request to the client without waiting for a response.
+// The response, if any, will be silently ignored by the read loop since no pending channel is registered.
+// This means any error returned by the client will not be observed. Use only for requests where the
+// response value is not needed (e.g., the client always returns null).
+func sendClientRequestFireAndForget[Req, Resp any](s *Server, info lsproto.RequestInfo[Req, Resp], params Req) error {
+	id := jsonrpc.NewIDString(fmt.Sprintf("ts%d", s.clientSeq.Add(1)))
+	req := info.NewRequestMessage(id, params)
+	return s.send(req.Message())
 }
 
 func (s *Server) sendResult(id *jsonrpc.ID, result any) error {
@@ -630,12 +1132,7 @@ func (s *Server) sendResponse(resp *lsproto.ResponseMessage) error {
 
 // send writes a message to the outgoing queue, respecting context cancellation.
 func (s *Server) send(msg *lsproto.Message) error {
-	select {
-	case s.outgoingQueue <- msg:
-		return nil
-	case <-s.backgroundCtx.Done():
-		return s.backgroundCtx.Err()
-	}
+	return s.outgoingQueue.Put(s.backgroundCtx, msg)
 }
 
 // handleRequestOrNotification looks up the handler for the given request or notification, executes its synchronous work
@@ -651,9 +1148,15 @@ func (s *Server) handleRequestOrNotification(ctx context.Context, req *lsproto.R
 			idStr = " (" + req.ID.String() + ")"
 		}
 		if err != nil {
+			if resp, ok := contentMapperFallbackResponse(req.Method, err); ok {
+				if !s.logger.IsTracing() {
+					s.logger.Info("handled method '", req.Method, "'", idStr, " in ", time.Since(start))
+				}
+				return nil, s.sendResult(req.ID, resp)
+			}
 			if _, ok := errors.AsType[userFacingRequestFailedError](err); !ok {
 				s.logger.Error("error handling method '", req.Method, "'", idStr, ": ", err)
-			} else {
+			} else if !s.logger.IsTracing() {
 				s.logger.Info("handled method '", req.Method, "'", idStr, " in ", time.Since(start))
 			}
 			return nil, err
@@ -664,11 +1167,17 @@ func (s *Server) handleRequestOrNotification(ctx context.Context, req *lsproto.R
 				asyncWorkErr := doAsyncWork()
 				_, isUserFacing := errors.AsType[userFacingRequestFailedError](asyncWorkErr)
 				isRealError := asyncWorkErr != nil && !isUserFacing
-				s.logger.Info(core.IfElse(isRealError, "error handling method '", "handled method '"), req.Method, "'", idStr, " in ", time.Since(start))
+				if isRealError {
+					s.logger.Info("error handling method '", req.Method, "'", idStr, " in ", time.Since(start))
+				} else if !s.logger.IsTracing() {
+					s.logger.Info("handled method '", req.Method, "'", idStr, " in ", time.Since(start))
+				}
 				return asyncWorkErr
 			}, nil
 		}
-		s.logger.Info("handled method '", req.Method, "'", idStr, " in ", time.Since(start))
+		if !s.logger.IsTracing() {
+			s.logger.Info("handled method '", req.Method, "'", idStr, " in ", time.Since(start))
+		}
 		return nil, nil
 	}
 	s.logger.Warn("unknown method '", req.Method, "'")
@@ -676,6 +1185,36 @@ func (s *Server) handleRequestOrNotification(ctx context.Context, req *lsproto.R
 		return nil, s.sendError(req.ID, lsproto.ErrorCodeInvalidRequest)
 	}
 	return nil, nil
+}
+
+// contentMapperFallbackResponse returns an empty response for requests made for
+// unknown file types not handled by any content mapper. This typically serves a
+// short window in time between when the server has unregistered content mapper
+// extensions and when the client has stopped sending requests for those file types.
+func contentMapperFallbackResponse(method lsproto.Method, err error) (any, bool) {
+	if !errors.Is(err, project.ErrNoProjectForUnknownScriptKind) {
+		return nil, false
+	}
+	switch method {
+	case lsproto.MethodTextDocumentDiagnostic:
+		return lsproto.DocumentDiagnosticResponse{
+			FullDocumentDiagnosticReport: &lsproto.RelatedFullDocumentDiagnosticReport{
+				Items: []*lsproto.Diagnostic{},
+			},
+		}, true
+	case lsproto.MethodTextDocumentHover,
+		lsproto.MethodTextDocumentSignatureHelp,
+		lsproto.MethodTextDocumentDefinition,
+		lsproto.MethodTextDocumentTypeDefinition,
+		lsproto.MethodTextDocumentImplementation,
+		lsproto.MethodTextDocumentReferences,
+		lsproto.MethodTextDocumentDocumentHighlight,
+		lsproto.MethodTextDocumentCompletion,
+		lsproto.MethodTextDocumentRename:
+		return lsproto.Null{}, true
+	default:
+		return nil, false
+	}
 }
 
 // handlerMap maps LSP method to a handler function. The handler function executes any work that must be done synchronously
@@ -698,6 +1237,7 @@ var handlers = sync.OnceValue(func() handlerMap {
 	registerNotificationHandler(handlers, lsproto.TextDocumentDidCloseInfo, (*Server).handleDidClose)
 	registerNotificationHandler(handlers, lsproto.WorkspaceDidChangeWatchedFilesInfo, (*Server).handleDidChangeWatchedFiles)
 	registerNotificationHandler(handlers, lsproto.SetTraceInfo, (*Server).handleSetTrace)
+	registerNotificationHandler(handlers, lsproto.CustomSetLogVerbosityInfo, (*Server).handleSetLogVerbosity)
 	registerRequestHandler(handlers, lsproto.WorkspaceWillRenameFilesInfo, (*Server).handleWillRenameFiles)
 
 	registerLanguageServiceDocumentRequestHandler(handlers, lsproto.TextDocumentDiagnosticInfo, (*Server).handleDocumentDiagnostic)
@@ -724,9 +1264,10 @@ var handlers = sync.OnceValue(func() handlerMap {
 	registerLanguageServiceWithAutoImportsRequestHandler(handlers, lsproto.TextDocumentCompletionInfo, (*Server).handleCompletion)
 	registerLanguageServiceWithAutoImportsRequestHandler(handlers, lsproto.TextDocumentCodeActionInfo, (*Server).handleCodeAction)
 
-	registerLanguageServiceDocumentRequestHandler(handlers, lsproto.TextDocumentVSOnAutoInsertInfo, (*Server).handleVsOnAutoInsert)
+	registerLanguageServiceDocumentRequestHandler(handlers, lsproto.TextDocumentVSOnAutoInsertInfo, (*Server).handleVSOnAutoInsert)
 
 	registerMultiProjectReferenceRequestHandler(handlers, lsproto.TextDocumentReferencesInfo, (*ls.LanguageService).ProvideReferences)
+	registerMultiProjectReferenceRequestHandler(handlers, lsproto.TextDocumentVSReferencesInfo, (*ls.LanguageService).ProvideVSReferences)
 	registerRequestHandler(handlers, lsproto.TextDocumentRenameInfo, (*Server).handleRename)
 	registerMultiProjectReferenceRequestHandler(handlers, lsproto.TextDocumentImplementationInfo, (*ls.LanguageService).ProvideImplementations)
 
@@ -748,6 +1289,7 @@ var handlers = sync.OnceValue(func() handlerMap {
 
 	registerRequestHandler(handlers, lsproto.CustomInitializeAPISessionInfo, (*Server).handleInitializeAPISession)
 	registerRequestHandler(handlers, lsproto.CustomProjectInfoInfo, (*Server).handleProjectInfo)
+	registerRequestHandler(handlers, lsproto.CustomSetContentMapperContributionsInfo, (*Server).handleSetContentMapperContributions)
 	return handlers
 })
 
@@ -757,10 +1299,9 @@ func registerNotificationHandler[Req any](handlers handlerMap, info lsproto.Noti
 			return nil, lsproto.ErrorCodeServerNotInitialized
 		}
 
-		var params Req
-		// Ignore empty params; all generated params are either pointers or any.
-		if req.Params != nil {
-			params = req.Params.(Req)
+		params, err := lsproto.UnmarshalParams[Req](req)
+		if err != nil {
+			return nil, err
 		}
 		if err := fn(s, ctx, params); err != nil {
 			return nil, err
@@ -779,10 +1320,9 @@ func registerRequestHandler[Req, Resp any](
 			return nil, lsproto.ErrorCodeServerNotInitialized
 		}
 
-		var params Req
-		// Ignore empty params.
-		if req.Params != nil {
-			params = req.Params.(Req)
+		params, err := lsproto.UnmarshalParams[Req](req)
+		if err != nil {
+			return nil, err
 		}
 		resp, err := fn(s, ctx, params, req)
 		if err != nil {
@@ -797,10 +1337,9 @@ func registerRequestHandler[Req, Resp any](
 
 func registerLanguageServiceDocumentRequestHandler[Req lsproto.HasTextDocumentURI, Resp any](handlers handlerMap, info lsproto.RequestInfo[Req, Resp], fn func(*Server, context.Context, *ls.LanguageService, Req) (Resp, error)) {
 	handlers[info.Method] = func(s *Server, ctx context.Context, req *lsproto.RequestMessage) (func() error, error) {
-		var params Req
-		// Ignore empty params.
-		if req.Params != nil {
-			params = req.Params.(Req)
+		params, err := lsproto.UnmarshalParams[Req](req)
+		if err != nil {
+			return nil, err
 		}
 		ls, err := s.session.GetLanguageService(ctx, params.TextDocumentURI())
 		if err != nil {
@@ -825,10 +1364,9 @@ func registerLanguageServiceDocumentRequestHandler[Req lsproto.HasTextDocumentUR
 
 func registerLanguageServiceWithAutoImportsRequestHandler[Req lsproto.HasTextDocumentURI, Resp any](handlers handlerMap, info lsproto.RequestInfo[Req, Resp], fn func(*Server, context.Context, *ls.LanguageService, Req) (Resp, error)) {
 	handlers[info.Method] = func(s *Server, ctx context.Context, req *lsproto.RequestMessage) (func() error, error) {
-		var params Req
-		// Ignore empty params.
-		if req.Params != nil {
-			params = req.Params.(Req)
+		params, err := lsproto.UnmarshalParams[Req](req)
+		if err != nil {
+			return nil, err
 		}
 		return s.session.WithLanguageServiceAndSnapshot(ctx, params.TextDocumentURI(), func(languageService *ls.LanguageService, snapshot *project.Snapshot) (func() error, error) {
 			return func() error {
@@ -865,10 +1403,9 @@ func registerMultiProjectReferenceRequestHandler[Req lsproto.HasTextDocumentPosi
 	fn func(*ls.LanguageService, context.Context, Req, ls.CrossProjectOrchestrator) (Resp, error),
 ) {
 	handlers[info.Method] = func(s *Server, ctx context.Context, req *lsproto.RequestMessage) (func() error, error) {
-		var params Req
-		// Ignore empty params.
-		if req.Params != nil {
-			params = req.Params.(Req)
+		params, err := lsproto.UnmarshalParams[Req](req)
+		if err != nil {
+			return nil, err
 		}
 		// !!! sheetal: multiple projects that contain the file through symlinks
 		defaultLs, orchestrator, err := s.getLanguageServiceAndCrossProjectOrchestrator(ctx, params.TextDocumentURI(), req)
@@ -940,24 +1477,21 @@ func (s *Server) recover(req *lsproto.RequestMessage) {
 		stack := debug.Stack()
 		s.logger.Errorf("panic handling request %s: %v\n%s", req.Method, r, string(stack))
 		if req.ID != nil {
-			err := s.sendError(req.ID, fmt.Errorf("%w: panic handling request %s: %v", lsproto.ErrorCodeInternalError, req.Method, r))
-			if err != nil {
-				return
-			}
-
-			if s.telemetryEnabled {
-				_ = sendNotification(s, lsproto.TelemetryEventInfo, lsproto.TelemetryEvent{
-					RequestFailureTelemetryEvent: &lsproto.RequestFailureTelemetryEvent{
-						Properties: &lsproto.RequestFailureTelemetryProperties{
-							ErrorCode:     lsproto.ErrorCodeInternalError.String(),
-							RequestMethod: strings.ReplaceAll(string(req.Method), "/", "."),
-							Stack:         sanitizeStackTrace(string(stack)),
-						},
-					},
-				})
-			}
+			_ = s.sendError(req.ID, fmt.Errorf("%w: panic handling request %s: %v", lsproto.ErrorCodeInternalError, req.Method, r))
 		} else {
 			s.logger.Error("unhandled panic in notification", req.Method, r)
+		}
+
+		if s.telemetryEnabled {
+			_ = sendNotification(s, lsproto.TelemetryEventInfo, lsproto.TelemetryEvent{
+				RequestFailureTelemetryEvent: &lsproto.RequestFailureTelemetryEvent{
+					Properties: &lsproto.RequestFailureTelemetryProperties{
+						ErrorCode:     lsproto.ErrorCodeInternalError.String(),
+						RequestMethod: strings.ReplaceAll(string(req.Method), "/", "."),
+						Stack:         sanitizeStackTrace(string(stack)),
+					},
+				},
+			})
 		}
 	}
 }
@@ -970,6 +1504,22 @@ func (s *Server) handleInitialize(ctx context.Context, params *lsproto.Initializ
 	s.initStarted.Store(true)
 
 	s.initializeParams = params
+	// The spec types initializationOptions as nullable; treat both null and an
+	// absent value as empty options so the rest of the server can read fields
+	// off s.initializationOptions without nil-checking the container.
+	if params.InitializationOptions != nil && params.InitializationOptions.InitializationOptions != nil {
+		s.initializationOptions = params.InitializationOptions.InitializationOptions
+	} else {
+		s.initializationOptions = &lsproto.InitializationOptions{}
+	}
+	if s.initializationOptions.LogVerbosity != nil {
+		if v := *s.initializationOptions.LogVerbosity; isValidLogVerbosity(v) {
+			s.logger.SetVerbosity(v)
+		}
+	}
+	if s.initializationOptions.TrackFlakyDiagnostics != nil {
+		s.flakeLogging = *s.initializationOptions.TrackFlakyDiagnostics
+	}
 	s.clientCapabilities = params.Capabilities.Resolve()
 	if s.clientCapabilities.Window.WorkDoneProgress {
 		s.projectProgress = newProjectLoadingProgress(s, s.progressDelay)
@@ -989,9 +1539,10 @@ func (s *Server) handleInitialize(ctx context.Context, params *lsproto.Initializ
 	if s.initializeParams.Locale != nil {
 		s.locale, _ = locale.Parse(*s.initializeParams.Locale)
 	}
+	s.initLocale = s.locale
 
-	if s.initializeParams.Trace != nil && *s.initializeParams.Trace == "verbose" {
-		s.logger.SetVerbose(true)
+	if s.startWatchdog != nil && params.ProcessId.Integer != nil {
+		s.startWatchdog(int(*params.ProcessId.Integer))
 	}
 
 	response := &lsproto.InitializeResult{
@@ -1027,17 +1578,20 @@ func (s *Server) handleInitialize(ctx context.Context, params *lsproto.Initializ
 			},
 			DiagnosticProvider: &lsproto.DiagnosticOptionsOrRegistrationOptions{
 				Options: &lsproto.DiagnosticOptions{
+					Identifier:            new("typescript"),
 					InterFileDependencies: true,
 				},
 			},
 			CompletionProvider: &lsproto.CompletionOptions{
-				TriggerCharacters: &ls.TriggerCharacters,
+				TriggerCharacters: &ls.CompletionTriggerCharacters,
 				ResolveProvider:   new(true),
-				// !!! other options
+				CompletionItem: &lsproto.ServerCompletionItemOptions{
+					LabelDetailsSupport: new(true),
+				},
 			},
 			SignatureHelpProvider: &lsproto.SignatureHelpOptions{
-				TriggerCharacters:   &[]string{"(", ",", "<"},
-				RetriggerCharacters: &[]string{")"},
+				TriggerCharacters:   &ls.SignatureHelpTriggerCharacters,
+				RetriggerCharacters: &ls.SignatureHelpRetriggerCharacters,
 			},
 			DocumentFormattingProvider: &lsproto.BooleanOrDocumentFormattingOptions{
 				Boolean: new(true),
@@ -1092,9 +1646,12 @@ func (s *Server) handleInitialize(ctx context.Context, params *lsproto.Initializ
 			CallHierarchyProvider: &lsproto.BooleanOrCallHierarchyOptionsOrCallHierarchyRegistrationOptions{
 				Boolean: new(true),
 			},
-			CustomSourceDefinitionProvider:       new(true),
-			CustomMultiDocumentHighlightProvider: new(true),
-			VSOnAutoInsertProvider: &lsproto.VsOnAutoInsertOptions{
+			Experimental: &lsproto.ExperimentalServerCapabilities{
+				CustomSourceDefinitionProvider:       new(true),
+				CustomMultiDocumentHighlightProvider: new(true),
+			},
+			VSReferencesProvider: new(true),
+			VSOnAutoInsertProvider: &lsproto.VSOnAutoInsertOptions{
 				VSTriggerCharacters: []string{">"},
 			},
 			Workspace: &lsproto.WorkspaceOptions{
@@ -1104,17 +1661,17 @@ func (s *Server) handleInitialize(ctx context.Context, params *lsproto.Initializ
 					},
 				},
 			},
-			// SemanticTokensProvider: &lsproto.SemanticTokensOptionsOrRegistrationOptions{
-			// 	Options: &lsproto.SemanticTokensOptions{
-			// 		Legend: ls.SemanticTokensLegend(s.clientCapabilities.TextDocument.SemanticTokens),
-			// 		Full: &lsproto.BooleanOrSemanticTokensFullDelta{
-			// 			Boolean: new(true),
-			// 		},
-			// 		Range: &lsproto.BooleanOrEmptyObject{
-			// 			Boolean: new(true),
-			// 		},
-			// 	},
-			// },
+			SemanticTokensProvider: &lsproto.SemanticTokensOptionsOrRegistrationOptions{
+				Options: &lsproto.SemanticTokensOptions{
+					Legend: ls.SemanticTokensLegend(s.clientCapabilities.TextDocument.SemanticTokens),
+					Full: &lsproto.BooleanOrSemanticTokensFullDelta{
+						Boolean: new(true),
+					},
+					Range: &lsproto.BooleanOrEmptyObject{
+						Boolean: new(true),
+					},
+				},
+			},
 		},
 	}
 
@@ -1122,8 +1679,37 @@ func (s *Server) handleInitialize(ctx context.Context, params *lsproto.Initializ
 }
 
 func (s *Server) handleInitialized(ctx context.Context, params *lsproto.InitializedParams) error {
-	if s.clientCapabilities.Workspace.DidChangeWatchedFiles.DynamicRegistration {
+	var disablePushDiagnostics bool
+	var enableTelemetry bool
+	if s.initializationOptions.DisablePushDiagnostics != nil {
+		disablePushDiagnostics = *s.initializationOptions.DisablePushDiagnostics
+	}
+	if s.initializationOptions.EnableTelemetry != nil {
+		enableTelemetry = *s.initializationOptions.EnableTelemetry
+	}
+	var runExternalCode bool
+	if s.initializationOptions.RunExternalCode != nil {
+		runExternalCode = *s.initializationOptions.RunExternalCode
+	}
+	hasDynamicWatchRegistration := s.clientCapabilities.Workspace.DidChangeWatchedFiles.DynamicRegistration
+	if hasDynamicWatchRegistration {
+		s.logger.Logf("file watching: using LSP client-side watching (client supports dynamic registration)")
 		s.watchEnabled = true
+	} else if fswatch.Default().HasFastRecursiveBackend() {
+		// The client cannot watch files itself, but the builtin watcher has a
+		// backend with efficient recursive watching (Windows or FSEvents), so
+		// fall back to watching files in-process.
+		s.logger.Logf("file watching: using builtin in-process watcher (client lacks dynamic watch registration)")
+		s.watchEnabled = true
+		s.builtinWatcher = lspwatcher.New(s.fs, func(changes []*lsproto.FileEvent) {
+			if s.session != nil {
+				s.session.DidChangeWatchedFiles(s.backgroundCtx, changes)
+			}
+		}, s.logger)
+	} else {
+		// The client cannot watch files and the builtin watcher backend lacks
+		// efficient recursive watching, so file watching is disabled.
+		s.logger.Logf("file watching: disabled (client lacks dynamic watch registration and builtin watcher backend is not fast-recursive)")
 	}
 
 	cwd := s.cwd
@@ -1141,16 +1727,6 @@ func (s *Server) handleInitialized(ctx context.Context, params *lsproto.Initiali
 		cwd = s.cwd
 	}
 
-	var disablePushDiagnostics bool
-	var enableTelemetry bool
-	if s.initializeParams != nil && s.initializeParams.InitializationOptions != nil {
-		if s.initializeParams.InitializationOptions.DisablePushDiagnostics != nil {
-			disablePushDiagnostics = *s.initializeParams.InitializationOptions.DisablePushDiagnostics
-		}
-		if s.initializeParams.InitializationOptions.EnableTelemetry != nil {
-			enableTelemetry = *s.initializeParams.InitializationOptions.EnableTelemetry
-		}
-	}
 	s.telemetryEnabled = enableTelemetry
 
 	s.session = project.NewSession(&project.SessionInit{
@@ -1165,13 +1741,15 @@ func (s *Server) handleInitialized(ctx context.Context, params *lsproto.Initiali
 			TelemetryEnabled:       enableTelemetry,
 			DebounceDelay:          500 * time.Millisecond,
 			PushDiagnosticsEnabled: !disablePushDiagnostics,
-			Locale:                 s.locale,
+			RunExternalCode:        runExternalCode,
 		},
-		FS:          s.fs,
-		Logger:      s.logger,
-		Client:      s,
-		NpmExecutor: s,
-		ParseCache:  s.parseCache,
+		FS:                  s.fs,
+		Logger:              s.logger,
+		Client:              s,
+		NpmExecutor:         s,
+		Spawner:             s.contentMapperSpawner(),
+		ContentMapperLogger: s.contentMapperLogger(),
+		ParseCache:          s.parseCache,
 	})
 
 	userPreferences, err := s.RequestConfiguration(ctx)
@@ -1212,6 +1790,9 @@ func (s *Server) handleInitialized(ctx context.Context, params *lsproto.Initiali
 }
 
 func (s *Server) handleShutdown(ctx context.Context, _ lsproto.NoParams, _ *lsproto.RequestMessage) (lsproto.ShutdownResponse, error) {
+	if s.builtinWatcher != nil {
+		s.builtinWatcher.Close()
+	}
 	s.session.Close()
 	return lsproto.ShutdownResponse{}, nil
 }
@@ -1254,23 +1835,77 @@ func (s *Server) handleDidChangeWatchedFiles(ctx context.Context, params *lsprot
 	return nil
 }
 
-func (s *Server) handleSetTrace(ctx context.Context, params *lsproto.SetTraceParams) error {
-	switch params.Value {
-	case "verbose":
-		s.logger.SetVerbose(true)
-	case "messages":
-		s.logger.SetVerbose(false)
-	case "off":
-		// !!! logging cannot be completely turned off for now
-		s.logger.SetVerbose(false)
-	default:
-		return fmt.Errorf("unknown trace value: %s", params.Value)
-	}
+func (s *Server) handleSetTrace(_ context.Context, _ *lsproto.SetTraceParams) error {
+	// $/setTrace is sent by vscode-languageclient when trace settings change.
+	// Server log verbosity is controlled separately by custom/setLogVerbosity,
+	// so this handler is intentionally a no-op.
 	return nil
 }
 
-func (s *Server) handleDocumentDiagnostic(ctx context.Context, ls *ls.LanguageService, params *lsproto.DocumentDiagnosticParams) (lsproto.DocumentDiagnosticResponse, error) {
-	return ls.ProvideDiagnostics(ctx, params.TextDocument.Uri)
+func (s *Server) handleSetLogVerbosity(_ context.Context, params *lsproto.SetLogVerbosityParams) error {
+	if !isValidLogVerbosity(params.Verbosity) {
+		return fmt.Errorf("%w: invalid log verbosity %d", lsproto.ErrorCodeInvalidParams, params.Verbosity)
+	}
+	s.logger.SetVerbosity(params.Verbosity)
+	return nil
+}
+
+func (s *Server) handleDocumentDiagnostic(ctx context.Context, languageService *ls.LanguageService, params *lsproto.DocumentDiagnosticParams) (lsproto.DocumentDiagnosticResponse, error) {
+	ctx = core.WithCheckerLifetime(ctx, core.CheckerLifetimeDiagnostics)
+	if s.flakeLogging == lsproto.DiagnosticFlakeLogLevelOff {
+		return languageService.ProvideDiagnostics(ctx, params.TextDocument.Uri)
+	}
+	direct, err := languageService.ProvideDiagnostics(ctx, params.TextDocument.Uri)
+	if err != nil {
+		return direct, err
+	}
+	languageService.GetProgram().Emit(ctx, compiler.EmitOptions{
+		WriteFile: func(fileName, text string, data *compiler.WriteFileData) error {
+			// do nothing
+			return nil
+		},
+	})
+	secondary, err2 := languageService.ProvideDiagnostics(ctx, params.TextDocument.Uri)
+	if err2 != nil {
+		return direct, err
+	}
+	missingFromPre, missingFromPost := lsproto.CompareDiagnostics(direct.FullDocumentDiagnosticReport.Items, secondary.FullDocumentDiagnosticReport.Items)
+	if len(missingFromPre) == 0 && len(missingFromPost) == 0 {
+		return direct, err
+	}
+
+	diff := generateDiagnosticDiffString(missingFromPre, missingFromPost, (*lsproto.Diagnostic).AsString)
+
+	s.logger.Error(diff)
+
+	if s.telemetryEnabled {
+		sanitizedDiff := generateDiagnosticDiffString(missingFromPre, missingFromPost, (*lsproto.Diagnostic).CodeAsString)
+		_ = sendNotification(s, lsproto.TelemetryEventInfo, lsproto.TelemetryEvent{
+			RequestFailureTelemetryEvent: &lsproto.RequestFailureTelemetryEvent{
+				Properties: &lsproto.RequestFailureTelemetryProperties{
+					ErrorCode:     lsproto.ErrorCodeInternalError.String(),
+					RequestMethod: "textDocument.diagnostic.flakeLog",
+					Stack:         sanitizedDiff,
+				},
+			},
+		})
+	}
+
+	if s.flakeLogging == lsproto.DiagnosticFlakeLogLevelPanic {
+		panic("flaky diagnostic(s) logged:\n" + diff)
+	}
+	return direct, err
+}
+
+func generateDiagnosticDiffString(missingFromPre []*lsproto.Diagnostic, missingFromPost []*lsproto.Diagnostic, stringifier func(*lsproto.Diagnostic) string) string {
+	var b strings.Builder
+	for _, elem := range missingFromPre {
+		b.WriteString(fmt.Sprintf("Diagnostic %v was present after emit but not before emit\n", stringifier(elem)))
+	}
+	for _, elem := range missingFromPost {
+		b.WriteString(fmt.Sprintf("Diagnostic %v was present before emit but not after emit\n", stringifier(elem)))
+	}
+	return b.String()
 }
 
 func (s *Server) handleHover(ctx context.Context, ls *ls.LanguageService, params *lsproto.HoverParams) (lsproto.HoverResponse, error) {
@@ -1348,7 +1983,7 @@ func (s *Server) handleWillRenameFilesWorker(ctx context.Context, params *lsprot
 		return lsproto.WillRenameFilesResponse{}, nil
 	}
 
-	services := s.session.GetLanguageServicesForDocuments(ctx, uris)
+	services := s.session.GetLanguageServicesForDocumentsLoadingProjectTree(ctx, uris)
 
 	type editKey struct {
 		uri    lsproto.DocumentUri
@@ -1449,7 +2084,7 @@ func (s *Server) handleFoldingRange(ctx context.Context, ls *ls.LanguageService,
 	return ls.ProvideFoldingRange(ctx, params.TextDocument.Uri)
 }
 
-func (s *Server) handleVsOnAutoInsert(ctx context.Context, ls *ls.LanguageService, params *lsproto.VsOnAutoInsertParams) (lsproto.VsOnAutoInsertResponse, error) {
+func (s *Server) handleVSOnAutoInsert(ctx context.Context, ls *ls.LanguageService, params *lsproto.VSOnAutoInsertParams) (lsproto.VSOnAutoInsertResponse, error) {
 	return ls.ProvideOnAutoInsert(ctx, params)
 }
 
@@ -1484,16 +2119,15 @@ func (s *Server) handleCompletion(ctx context.Context, languageService *ls.Langu
 
 func (s *Server) handleCompletionItemResolve(ctx context.Context, params *lsproto.CompletionItem, reqMsg *lsproto.RequestMessage) (lsproto.CompletionResolveResponse, error) {
 	data := params.Data
+	if data == nil {
+		return nil, errors.New("completion item data is nil")
+	}
 	languageService, err := s.session.GetLanguageService(ctx, lsconv.FileNameToDocumentURI(data.FileName))
 	if err != nil {
 		return nil, err
 	}
 	defer s.recover(reqMsg)
-	return languageService.ResolveCompletionItem(
-		ctx,
-		params,
-		data,
-	)
+	return languageService.ResolveCompletionItem(ctx, params, data)
 }
 
 func (s *Server) handleDocumentFormat(ctx context.Context, ls *ls.LanguageService, params *lsproto.DocumentFormattingParams) (lsproto.DocumentFormattingResponse, error) {
@@ -1526,16 +2160,28 @@ func (s *Server) handleDocumentOnTypeFormat(ctx context.Context, ls *ls.Language
 func (s *Server) handleWorkspaceSymbol(ctx context.Context, params *lsproto.WorkspaceSymbolParams, reqMsg *lsproto.RequestMessage) (lsproto.WorkspaceSymbolResponse, error) {
 	var resp lsproto.WorkspaceSymbolResponse
 	var lsErr error
-	s.session.WithSnapshotLoadingProjectTree(ctx, nil, func(snapshot *project.Snapshot) {
+	provideSymbols := func(snapshot *project.Snapshot, programs []*compiler.Program) {
 		defer s.recover(reqMsg)
-		programs := core.Map(snapshot.ProjectCollection.Projects(), (*project.Project).GetProgram)
 		resp, lsErr = ls.ProvideWorkspaceSymbols(
 			ctx,
 			programs,
 			snapshot.Converters(),
 			snapshot.UserPreferences(),
-			params.Query)
-	})
+			params.Query,
+		)
+	}
+	if params.TextDocument != nil && s.session.Config().WorkspaceSymbolsScope == lsutil.WorkspaceSymbolsScopeCurrentProject {
+		uri := params.TextDocument.Uri
+		s.session.WithSnapshotForDocument(ctx, uri, func(snapshot *project.Snapshot) {
+			programs := core.Map(snapshot.GetProjectsContainingFile(uri), ls.Project.GetProgram)
+			provideSymbols(snapshot, programs)
+		})
+	} else {
+		s.session.WithSnapshotLoadingProjectTree(ctx, nil, func(snapshot *project.Snapshot) {
+			programs := core.Map(snapshot.ProjectCollection.Projects(), (*project.Project).GetProgram)
+			provideSymbols(snapshot, programs)
+		})
+	}
 	return resp, lsErr
 }
 
@@ -1590,7 +2236,7 @@ func (s *Server) handleCodeLensResolve(ctx context.Context, codeLens *lsproto.Co
 	return defaultLs.ResolveCodeLens(
 		ctx,
 		codeLens,
-		s.initializeParams.InitializationOptions.CodeLensShowLocationsCommandName,
+		s.initializationOptions.CodeLensShowLocationsCommandName,
 		orchestrator,
 	)
 }
@@ -1654,7 +2300,7 @@ func (s *Server) handleInitializeAPISession(ctx context.Context, params *lsproto
 		pipePath = s.generateAPIPipePath()
 	}
 
-	transport, err := api.NewPipeTransport(pipePath)
+	transport, err := ipc.NewPipeTransport(pipePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create API transport: %w", err)
 	}
@@ -1689,7 +2335,7 @@ func (s *Server) handleInitializeAPISession(ctx context.Context, params *lsproto
 			}
 		}()
 
-		conn := api.NewAsyncConn(rwc, apiSession)
+		conn := ipc.NewAsyncConn(rwc, apiSession)
 		if apiErr := conn.Run(apiCtx); apiErr != nil {
 			s.logger.Errorf("API session %s: %v", apiSession.ID(), apiErr)
 		}
@@ -1707,7 +2353,7 @@ func (s *Server) generateAPIPipePath() string {
 	// Generate a high-entropy path using time and random source
 	now := time.Now().UnixNano()
 	rnd := rand.Uint64()
-	return api.GeneratePipePath(fmt.Sprintf("tsgo-api-%x-%x", now, rnd))
+	return ipc.GeneratePipePath(fmt.Sprintf("tsgo-api-%x-%x", now, rnd))
 }
 
 func (s *Server) removeAPISession(id string) {
@@ -1727,6 +2373,23 @@ func (s *Server) SetCompilerOptionsForInferredProjects(ctx context.Context, opti
 // NpmInstall implements ata.NpmExecutor
 func (s *Server) NpmInstall(cwd string, args []string) ([]byte, error) {
 	return s.npmInstall(cwd, args)
+}
+
+// contentMapperSpawner adapts the server's spawn callback to a content mapper spawner, or returns nil when
+// the server cannot spawn processes.
+func (s *Server) contentMapperSpawner() contentmapper.Spawner {
+	if s.spawn == nil {
+		return nil
+	}
+	return contentmapper.SpawnerFunc(s.spawn)
+}
+
+func (s *Server) contentMapperLogger() contentmapper.Logger {
+	return func(message string) {
+		if s.logger.IsTracing() {
+			s.logger.Info(message)
+		}
+	}
 }
 
 // Developer/debugging command handlers
@@ -1786,4 +2449,94 @@ func (s *Server) handleProjectInfo(ctx context.Context, params *lsproto.ProjectI
 	return &lsproto.ProjectInfoResult{
 		ConfigFilePath: configFilePath,
 	}, nil
+}
+
+func (s *Server) handleSetContentMapperContributions(ctx context.Context, params *lsproto.SetContentMapperContributionsParams, _ *lsproto.RequestMessage) (lsproto.CustomSetContentMapperContributionsResponse, error) {
+	contributions, err := parseContentMapperContributions(params.Contributions)
+	if err != nil {
+		return lsproto.Null{}, err
+	}
+	documents := core.Map(params.OpenDocuments, func(document lsproto.TextDocumentIdentifier) lsproto.DocumentUri { return document.Uri })
+	s.session.SetContentMapperContributions(ctx, contributions, documents)
+	return lsproto.Null{}, nil
+}
+
+func parseContentMapperContributions(values []*lsproto.ContentMapperContribution) (project.ContentMapperContributions, error) {
+	var result project.ContentMapperContributions
+	var claimedExtensions collections.Set[string]
+	for index, value := range values {
+		if value == nil || value.ContributorId == "" {
+			return result, errors.New("content mapper contribution requires a contributorId")
+		}
+		identity := fmt.Sprintf("%s[%d]", value.ContributorId, index)
+		validExtensions := make([]string, 0, len(value.Extensions))
+		for _, extension := range value.Extensions {
+			if !isValidContributedContentMapperExtension(extension) {
+				return result, fmt.Errorf("content mapper contribution %q has invalid extension %q", identity, extension)
+			}
+			validExtensions = append(validExtensions, extension)
+		}
+		if value.InferredProjectContribution == nil {
+			continue
+		}
+		inferredProject := value.InferredProjectContribution
+		manifest := inferredProject.Manifest
+		if manifest.Name == "" || len(manifest.Exec) == 0 {
+			return result, fmt.Errorf("content mapper contribution %q requires a manifest name and exec", identity)
+		}
+		for _, option := range valueOrZero(manifest.CompilerOptions) {
+			if tsoptions.CommandLineCompilerOptionsMap.Get(option) == nil {
+				return result, fmt.Errorf("content mapper contribution %q requests unknown compiler option %q", identity, option)
+			}
+		}
+		for _, extension := range validExtensions {
+			if !claimedExtensions.AddIfAbsent(extension) {
+				return result, fmt.Errorf("content mapper contributions both claim extension %q", extension)
+			}
+			result.Extensions = append(result.Extensions, extension)
+		}
+		options := []byte("{}")
+		if inferredProject.Options != nil {
+			var err error
+			options, err = json.Marshal(*inferredProject.Options)
+			if err != nil {
+				return result, fmt.Errorf("content mapper contribution %q has invalid options", identity)
+			}
+		}
+		mapper := &contentmapper.Mapper{
+			Definition: contentmapper.Definition{Package: identity, Extensions: validExtensions, Options: options},
+			Manifest: contentmapper.Manifest{
+				Name:            manifest.Name,
+				Version:         valueOrZero(manifest.Version),
+				Exec:            slices.Clone(manifest.Exec),
+				CompilerOptions: slices.Clone(valueOrZero(manifest.CompilerOptions)),
+				DynamicConfig:   valueOrZero(manifest.DynamicConfig),
+			},
+			ContributionID: identity,
+		}
+		if manifest.Cwd != nil {
+			if !tspath.PathIsAbsolute(*manifest.Cwd) {
+				return result, fmt.Errorf("content mapper contribution %q has non-absolute cwd", identity)
+			}
+			mapper.PackageDirectory = *manifest.Cwd
+		}
+		result.Mappers = append(result.Mappers, mapper)
+	}
+	slices.Sort(result.Extensions)
+	return result, nil
+}
+
+func isValidContributedContentMapperExtension(extension string) bool {
+	if len(extension) <= 1 || extension[0] != '.' || tspath.GetAnyExtensionFromPath("file"+extension, nil, false) != extension {
+		return false
+	}
+	return !slices.Contains(core.Flatten(tspath.AllSupportedExtensionsWithJson), extension)
+}
+
+func valueOrZero[T any](value *T) T {
+	if value == nil {
+		var zero T
+		return zero
+	}
+	return *value
 }

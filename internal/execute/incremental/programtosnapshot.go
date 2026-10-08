@@ -32,6 +32,7 @@ func programToSnapshot(program *compiler.Program, oldProgram *Program, hashWithT
 		to.reuseFromOldProgram()
 		to.computeProgramFileChanges()
 		to.handleFileDelete()
+		to.handleGlobalScopeChange()
 		to.handlePendingEmit()
 		to.handlePendingCheck()
 	}
@@ -62,6 +63,8 @@ func (t *toProgramSnapshot) reuseFromOldProgram() {
 		t.snapshot.buildInfoEmitPending.Store(t.oldProgram.snapshot.buildInfoEmitPending.Load())
 		t.snapshot.hasErrorsFromOldState = t.oldProgram.snapshot.hasErrors
 		t.snapshot.hasSemanticErrorsFromOldState = t.oldProgram.snapshot.hasSemanticErrors
+		t.snapshot.packageJsonsFromOldState = t.oldProgram.snapshot.packageJsons
+		t.snapshot.missingPackageJsonsFromOldState = t.oldProgram.snapshot.missingPackageJsons
 	} else {
 		t.snapshot.buildInfoEmitPending.Store(t.snapshot.options.IsIncremental())
 	}
@@ -88,7 +91,11 @@ func (t *toProgramSnapshot) computeProgramFileChanges() {
 	wg := core.NewWorkGroup(t.program.SingleThreaded())
 	for _, file := range files {
 		wg.Queue(func() {
-			version := t.snapshot.computeHash(file.Text())
+			versionText := file.Text()
+			if file.ContentMapper() != "" {
+				versionText = file.OriginalText() + "\x00" + file.ContentMapperTransformIdentity()
+			}
+			version := t.snapshot.computeHash(versionText)
 			impliedNodeFormat := t.program.GetSourceFileMetaData(file.Path()).ImpliedNodeFormat
 			affectsGlobalScope := fileAffectsGlobalScope(file)
 			var signature string
@@ -169,6 +176,28 @@ func (t *toProgramSnapshot) handleFileDelete() {
 			}
 			return true
 		})
+	}
+}
+
+func (t *toProgramSnapshot) handleGlobalScopeChange() {
+	if t.oldProgram == nil || t.globalFileRemoved {
+		return
+	}
+	globalScopeLost := false
+	t.oldProgram.snapshot.fileInfos.Range(func(filePath tspath.Path, oldInfo *FileInfo) bool {
+		if !oldInfo.affectsGlobalScope {
+			return true
+		}
+		if newInfo, ok := t.snapshot.fileInfos.Load(filePath); ok && !newInfo.affectsGlobalScope {
+			globalScopeLost = true
+			return false
+		}
+		return true
+	})
+	if globalScopeLost {
+		for _, file := range t.snapshot.getAllFilesExcludingDefaultLibraryFile(t.program, nil) {
+			t.snapshot.addFileToChangeSet(file.Path())
+		}
 	}
 }
 
@@ -355,6 +384,8 @@ func repopulateDiagnosticMessageChain(chain []*ast.Diagnostic, p *compiler.Progr
 				end:            c.End(),
 				code:           c.Code(),
 				category:       c.Category(),
+				source:         c.Source(),
+				messageText:    c.MessageText(),
 				messageKey:     c.MessageKey(),
 				messageArgs:    c.MessageArgs(),
 				repopulateInfo: c.RepopulateInfo(),
@@ -390,6 +421,8 @@ func astDiagToBuildInfoDiag(d *ast.Diagnostic) *buildInfoDiagnosticWithFileName 
 		end:            d.End(),
 		code:           d.Code(),
 		category:       d.Category(),
+		source:         d.Source(),
+		messageText:    d.MessageText(),
 		messageKey:     d.MessageKey(),
 		messageArgs:    d.MessageArgs(),
 		repopulateInfo: d.RepopulateInfo(),

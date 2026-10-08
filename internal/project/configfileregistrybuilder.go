@@ -5,6 +5,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"sync"
 
 	"github.com/microsoft/typescript-go/internal/collections"
 	"github.com/microsoft/typescript-go/internal/core"
@@ -36,6 +37,8 @@ type configFileRegistryBuilder struct {
 	configs                     *dirty.SyncMap[tspath.Path, *configFileEntry]
 	configFileNames             *dirty.Map[tspath.Path, *configFileNames]
 	customConfigFileNameChanged bool
+	contentMappersMu            sync.Mutex
+	allConfiguredContentMappers *configuredContentMappers
 }
 
 func newConfigFileRegistryBuilder(
@@ -58,6 +61,7 @@ func newConfigFileRegistryBuilder(
 		snapshotID:                   snapshotID,
 		customConfigFileName:         customConfigFileName,
 		customConfigFileNameChanged:  customConfigFileName != oldConfigFileRegistry.customConfigFileName,
+		allConfiguredContentMappers:  oldConfigFileRegistry.contentMappers(),
 
 		configs:         dirty.NewSyncMap(oldConfigFileRegistry.configs),
 		configFileNames: dirty.NewMap(oldConfigFileRegistry.configFileNames),
@@ -79,6 +83,7 @@ func (c *configFileRegistryBuilder) Finalize() *ConfigFileRegistry {
 	if configs, changedConfigs := c.configs.Finalize(); changedConfigs {
 		ensureCloned()
 		newRegistry.configs = configs
+		newRegistry.allConfiguredContentMappers = c.contentMappers()
 	}
 
 	if configFileNames, changedNames := c.configFileNames.Finalize(); changedNames {
@@ -92,6 +97,28 @@ func (c *configFileRegistryBuilder) Finalize() *ConfigFileRegistry {
 	}
 
 	return newRegistry
+}
+
+func (c *configFileRegistryBuilder) contentMappers() *configuredContentMappers {
+	c.contentMappersMu.Lock()
+	defer c.contentMappersMu.Unlock()
+	if c.allConfiguredContentMappers == nil {
+		var commandLines []*tsoptions.ParsedCommandLine
+		c.configs.Range(func(entry *dirty.SyncMapEntry[tspath.Path, *configFileEntry]) bool {
+			if commandLine := entry.Value().commandLine; commandLine != nil {
+				commandLines = append(commandLines, commandLine)
+			}
+			return true
+		})
+		c.allConfiguredContentMappers = collectConfiguredContentMappers(commandLines)
+	}
+	return c.allConfiguredContentMappers
+}
+
+func (c *configFileRegistryBuilder) invalidateContentMappers() {
+	c.contentMappersMu.Lock()
+	c.allConfiguredContentMappers = nil
+	c.contentMappersMu.Unlock()
 }
 
 func (c *configFileRegistryBuilder) findOrAcquireConfigForFile(
@@ -117,22 +144,29 @@ func (c *configFileRegistryBuilder) findOrAcquireConfigForFile(
 // reloadIfNeeded updates the command line of the config file entry based on its
 // pending reload state. This function should only be called from within the
 // Change() method of a dirty map entry.
-func (c *configFileRegistryBuilder) reloadIfNeeded(entry *configFileEntry, fileName string, path tspath.Path, logger *logging.LogTree) {
+func (c *configFileRegistryBuilder) reloadIfNeeded(entry *configFileEntry, fileName string, path tspath.Path, logger *logging.LogTree) bool {
+	oldCommandLine := entry.commandLine
 	switch entry.pendingReload {
 	case PendingReloadFileNames:
 		logger.Log("Reloading file names for config: " + fileName)
 		entry.commandLine = entry.commandLine.ReloadFileNamesOfParsedCommandLine(c.fs)
 	case PendingReloadFull:
 		logger.Log("Loading config file: " + fileName)
-		oldCommandLine := entry.commandLine
-		entry.commandLine, _ = tsoptions.GetParsedCommandLineOfConfigFilePath(fileName, path, nil, nil /*optionsRaw*/, c, c)
+		// When the workspace is trusted, enable external content mappers so a config's contentMappers pass
+		// the runExternalCode gate and register, as they would with the CLI flag.
+		var existingOptions *core.CompilerOptions
+		if c.sessionOptions.RunExternalCode {
+			existingOptions = &core.CompilerOptions{RunExternalCode: core.TSTrue}
+		}
+		entry.commandLine, _ = tsoptions.GetParsedCommandLineOfConfigFilePath(fileName, path, existingOptions, nil /*optionsRaw*/, c, c)
 		c.updateExtendingConfigs(path, entry.commandLine, oldCommandLine)
 		c.updateRootFilesWatch(fileName, entry)
 		logger.Log("Finished loading config file")
 	default:
-		return
+		return false
 	}
 	entry.pendingReload = PendingReloadNone
+	return oldCommandLine != entry.commandLine
 }
 
 func (c *configFileRegistryBuilder) updateExtendingConfigs(extendingConfigPath tspath.Path, newCommandLine *tsoptions.ParsedCommandLine, oldCommandLine *tsoptions.ParsedCommandLine) {
@@ -248,6 +282,7 @@ func (c *configFileRegistryBuilder) updateRootFilesWatch(fileName string, entry 
 func (c *configFileRegistryBuilder) acquireConfigForProject(fileName string, path tspath.Path, project *Project, logger *logging.LogTree) *tsoptions.ParsedCommandLine {
 	entry, _ := c.configs.LoadOrStore(path, newConfigFileEntry(c.hasRelativePatternCapability, fileName))
 	var needsRetainProject bool
+	var contentMappersChanged bool
 	entry.ChangeIf(
 		func(config *configFileEntry) bool {
 			_, alreadyRetaining := config.retainingProjects[project.configFilePath]
@@ -261,9 +296,12 @@ func (c *configFileRegistryBuilder) acquireConfigForProject(fileName string, pat
 				}
 				config.retainingProjects[project.configFilePath] = struct{}{}
 			}
-			c.reloadIfNeeded(config, fileName, path, logger)
+			contentMappersChanged = c.reloadIfNeeded(config, fileName, path, logger)
 		},
 	)
+	if contentMappersChanged {
+		c.invalidateContentMappers()
+	}
 	return entry.Value().commandLine
 }
 
@@ -274,6 +312,7 @@ func (c *configFileRegistryBuilder) acquireConfigForProject(fileName string, pat
 func (c *configFileRegistryBuilder) acquireConfigForFile(configFileName string, configFilePath tspath.Path, filePath tspath.Path, logger *logging.LogTree) *tsoptions.ParsedCommandLine {
 	entry, _ := c.configs.LoadOrStore(configFilePath, newConfigFileEntry(c.hasRelativePatternCapability, configFileName))
 	var needsRetainOpenFile bool
+	var contentMappersChanged bool
 	entry.ChangeIf(
 		func(config *configFileEntry) bool {
 			if c.isOpenFile(filePath) {
@@ -289,9 +328,12 @@ func (c *configFileRegistryBuilder) acquireConfigForFile(configFileName string, 
 				}
 				config.retainingOpenFiles[filePath] = struct{}{}
 			}
-			c.reloadIfNeeded(config, configFileName, configFilePath, logger)
+			contentMappersChanged = c.reloadIfNeeded(config, configFileName, configFilePath, logger)
 		},
 	)
+	if contentMappersChanged {
+		c.invalidateContentMappers()
+	}
 	return entry.Value().commandLine
 }
 
@@ -369,7 +411,7 @@ func (c *configFileRegistryBuilder) invalidateCache(logger *logging.LogTree) cha
 			affectedProjects = core.CopyMapInto(affectedProjects, entry.retainingProjects)
 			if entry.pendingReload != PendingReloadFull {
 				text, ok := c.FS().ReadFile(entry.fileName)
-				if !ok || text != entry.commandLine.ConfigFile.SourceFile.Text() {
+				if !ok || entry.commandLine == nil || text != entry.commandLine.ConfigFile.SourceFile.Text() {
 					entry.pendingReload = PendingReloadFull
 				} else {
 					entry.pendingReload = PendingReloadFileNames
@@ -400,7 +442,7 @@ func (c *configFileRegistryBuilder) DidChangeFiles(summary FileChangeSummary, lo
 	createdFiles := make(map[tspath.Path]string, summary.Created.Len())
 	deletedFiles := make(map[tspath.Path]string, summary.Deleted.Len())
 	createdOrDeletedConfigFiles := make(map[tspath.Path]struct{})
-	createdOrChangedOrDeletedFiles := make(map[tspath.Path]struct{}, summary.Changed.Len()+summary.Deleted.Len())
+	createdOrChangedOrDeletedFiles := make(map[tspath.Path]struct{}, summary.Changed.Len()+summary.Created.Len()+summary.Deleted.Len())
 	for uri := range summary.Changed.Keys() {
 		if tspath.ContainsIgnoredPath(string(uri)) {
 			continue
@@ -449,8 +491,8 @@ func (c *configFileRegistryBuilder) DidChangeFiles(summary FileChangeSummary, lo
 		c.didCloseFile(path)
 	}
 
-	// Handle changes to stored config files
-	logger.Log("Checking if any changed files are config files")
+	// Handle changes to stored config files and their content mapper package manifests.
+	logger.Log("Checking if any changed files are configuration files")
 	for path := range createdOrChangedOrDeletedFiles {
 		if entry, ok := c.configs.Load(path); ok {
 			if hasExcessiveChanges {
@@ -465,6 +507,18 @@ func (c *configFileRegistryBuilder) DidChangeFiles(summary FileChangeSummary, lo
 			}
 			// This was a config file, so assume it's not also a root file
 			delete(createdFiles, path)
+		} else if tspath.GetBaseFileName(string(path)) == "package.json" {
+			manifestChanged := false
+			c.configs.Range(func(entry *dirty.SyncMapEntry[tspath.Path, *configFileEntry]) bool {
+				if contentMapperManifestPath(entry.Value().commandLine, c.fs.toPath, path) {
+					affectedProjects = core.CopyMapInto(affectedProjects, c.handleConfigChange(entry, logger))
+					manifestChanged = true
+				}
+				return true
+			})
+			if manifestChanged {
+				c.invalidateContentMappers()
+			}
 		}
 	}
 
@@ -578,6 +632,19 @@ func (c *configFileRegistryBuilder) handleConfigChange(entry *dirty.SyncMapEntry
 	return affectedProjects
 }
 
+func contentMapperManifestPath(commandLine *tsoptions.ParsedCommandLine, toPath func(string) tspath.Path, path tspath.Path) bool {
+	if commandLine == nil {
+		return false
+	}
+	for _, mapper := range commandLine.ContentMappers() {
+		if mapper.Package != "" && mapper.ContributionID == "" && mapper.PackageDirectory != "" &&
+			toPath(tspath.CombinePaths(mapper.PackageDirectory, "package.json")) == path {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *configFileRegistryBuilder) computeConfigFileName(fileName string, skipSearchInDirectoryOfFile bool, logger *logging.LogTree) string {
 	searchPath := tspath.GetDirectoryPath(fileName)
 	// Prefer custom config file if provided; search ancestors with correct skip behavior.
@@ -601,13 +668,20 @@ func (c *configFileRegistryBuilder) computeConfigFileName(fileName string, skipS
 		}
 	}
 
-	skip := skipSearchInDirectoryOfFile
+	// When searching for ancestor of a config file, determine which config types to skip
+	// in the starting directory. This matches TSServer's forEachConfigFileLocation behavior:
+	// - For ancestor of tsconfig.json: skip tsconfig.json but still check jsconfig.json
+	// - For ancestor of jsconfig.json: skip both tsconfig.json and jsconfig.json
+	skipTsconfig := skipSearchInDirectoryOfFile
+	skipJsconfig := skipSearchInDirectoryOfFile && !strings.HasSuffix(fileName, "/tsconfig.json")
 	result, _ := tspath.ForEachAncestorDirectory(searchPath, func(directory string) (result string, stop bool) {
-		if !skip {
+		if !skipTsconfig {
 			tsconfigPath := tspath.CombinePaths(directory, "tsconfig.json")
 			if c.FS().FileExists(tsconfigPath) {
 				return tsconfigPath, true
 			}
+		}
+		if !skipJsconfig {
 			jsconfigPath := tspath.CombinePaths(directory, "jsconfig.json")
 			if c.FS().FileExists(jsconfigPath) {
 				return jsconfigPath, true
@@ -616,7 +690,8 @@ func (c *configFileRegistryBuilder) computeConfigFileName(fileName string, skipS
 		if strings.HasSuffix(directory, "/node_modules") {
 			return "", true
 		}
-		skip = false
+		skipTsconfig = false
+		skipJsconfig = false
 		return "", false
 	})
 	logger.Logf("computeConfigFileName:: File: %s:: Result: %s", fileName, result)
@@ -698,7 +773,7 @@ func (c *configFileRegistryBuilder) GetCurrentDirectory() string {
 }
 
 // GetExtendedConfig implements tsoptions.ExtendedConfigCache.
-func (c *configFileRegistryBuilder) GetExtendedConfig(fileName string, path tspath.Path, resolutionStack []string, host tsoptions.ParseConfigHost) *tsoptions.ExtendedConfigCacheEntry {
+func (c *configFileRegistryBuilder) GetExtendedConfig(fileName string, path tspath.Path, resolutionStack []tspath.Path, host tsoptions.ParseConfigHost) *tsoptions.ExtendedConfigCacheEntry {
 	var content string
 	fh := c.fs.GetFileByPath(fileName, path)
 	if fh != nil {
@@ -716,10 +791,16 @@ func (c *configFileRegistryBuilder) GetExtendedConfig(fileName string, path tspa
 }
 
 func (c *configFileRegistryBuilder) Cleanup() {
+	changed := false
 	c.configs.Range(func(entry *dirty.SyncMapEntry[tspath.Path, *configFileEntry]) bool {
 		entry.DeleteIf(func(value *configFileEntry) bool {
-			return len(value.retainingProjects) == 0 && len(value.retainingOpenFiles) == 0 && len(value.retainingConfigs) == 0
+			shouldDelete := len(value.retainingProjects) == 0 && len(value.retainingOpenFiles) == 0 && len(value.retainingConfigs) == 0
+			changed = changed || shouldDelete
+			return shouldDelete
 		})
 		return true
 	})
+	if changed {
+		c.invalidateContentMappers()
+	}
 }

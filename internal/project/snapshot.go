@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/microsoft/typescript-go/internal/collections"
+	"github.com/microsoft/typescript-go/internal/contentmapper"
 	"github.com/microsoft/typescript-go/internal/core"
 	"github.com/microsoft/typescript-go/internal/ls"
 	"github.com/microsoft/typescript-go/internal/ls/autoimport"
@@ -35,16 +37,43 @@ type Snapshot struct {
 	converters     *lsconv.Converters
 
 	// Immutable state, cloned between snapshots
-	fs                                 *SnapshotFS
-	ProjectCollection                  *ProjectCollection
-	ConfigFileRegistry                 *ConfigFileRegistry
-	AutoImports                        *autoimport.Registry
-	autoImportsWatch                   *WatchedFiles[map[tspath.Path]string]
-	compilerOptionsForInferredProjects *core.CompilerOptions
-	userPreferences                    lsutil.UserPreferences
+	fs                                     *SnapshotFS
+	ProjectCollection                      *ProjectCollection
+	ConfigFileRegistry                     *ConfigFileRegistry
+	AutoImports                            *autoimport.Registry
+	autoImportsWatch                       *WatchedFiles[map[tspath.Path]string]
+	compilerOptionsForInferredProjects     *core.CompilerOptions
+	inferredProjectContentMappers          []*contentmapper.Mapper
+	inferredProjectContentMapperExtensions []string
+	userPreferences                        lsutil.UserPreferences
+	contentMapperWatchStateOnce            sync.Once
+	contentMapperExtensions                []string
+	contentMapperWatchedFiles              *collections.Set[tspath.Path]
 
 	builderLogs *logging.LogTree
 	apiError    error
+}
+
+func (s *Snapshot) contentMapperWatchState() ([]string, *collections.Set[tspath.Path]) {
+	s.contentMapperWatchStateOnce.Do(func() {
+		configured := s.ConfigFileRegistry.contentMappers()
+		if configured != nil {
+			s.contentMapperExtensions = slices.Clone(configured.extensions)
+		}
+		s.contentMapperExtensions = append(s.contentMapperExtensions, s.inferredProjectContentMapperExtensions...)
+		slices.Sort(s.contentMapperExtensions)
+		s.contentMapperExtensions = slices.Compact(s.contentMapperExtensions)
+
+		s.contentMapperWatchedFiles = &collections.Set[tspath.Path]{}
+		for _, project := range s.ProjectCollection.Projects() {
+			if project.contentMapperWatchedFiles != nil {
+				for path := range project.contentMapperWatchedFiles.Keys() {
+					s.contentMapperWatchedFiles.Add(path)
+				}
+			}
+		}
+	})
+	return s.contentMapperExtensions, s.contentMapperWatchedFiles
 }
 
 // NewSnapshot initializes a snapshot with refCount 1.
@@ -68,7 +97,7 @@ func NewSnapshot(
 
 		fs:                                 fs,
 		ConfigFileRegistry:                 configFileRegistry,
-		ProjectCollection:                  &ProjectCollection{toPath: toPath},
+		ProjectCollection:                  &ProjectCollection{toPath: toPath, openFiles: openFilePaths(fs.overlays)},
 		compilerOptionsForInferredProjects: compilerOptionsForInferredProjects,
 		userPreferences:                    userPreferences,
 		AutoImports:                        autoImports,
@@ -159,6 +188,8 @@ func (s *Snapshot) ReadDirectory(currentDir string, path string, extensions []st
 type APISnapshotRequest struct {
 	OpenProjects  *collections.Set[string]
 	CloseProjects *collections.Set[tspath.Path]
+	OpenFiles     *collections.Set[lsproto.DocumentUri]
+	CloseFiles    *collections.Set[tspath.Path]
 }
 
 type ProjectTreeRequest struct {
@@ -210,6 +241,7 @@ type SnapshotChange struct {
 	// It should only be set the value in the next snapshot should be changed. If nil, the
 	// value from the previous snapshot will be copied to the new snapshot.
 	compilerOptionsForInferredProjects *core.CompilerOptions
+	contentMapperContributions         *ContentMapperContributions
 	newConfig                          *lsutil.UserPreferences
 	// ataChanges contains ATA-related changes to apply to projects in the new snapshot.
 	ataChanges map[tspath.Path]*ATAStateChange
@@ -230,7 +262,12 @@ type ATAStateChange struct {
 	Logs                *logging.LogTree
 }
 
-func (s *Snapshot) Clone(ctx context.Context, change SnapshotChange, overlays map[tspath.Path]*Overlay, session *Session) *Snapshot {
+func (s *Snapshot) Clone(
+	ctx context.Context,
+	change SnapshotChange,
+	overlays map[tspath.Path]*Overlay,
+	session *Session,
+) *Snapshot {
 	var logger *logging.LogTree
 
 	// Print in-progress logs immediately if cloning fails
@@ -264,6 +301,8 @@ func (s *Snapshot) Clone(ctx context.Context, change SnapshotChange, overlays ma
 		switch change.reason {
 		case UpdateReasonDidOpenFile:
 			logger.Logf("Reason: DidOpenFile - %s", change.fileChanges.Opened)
+		case UpdateReasonDidCloseFile:
+			logger.Logf("Reason: DidCloseFile - %v", change.fileChanges.Closed)
 		case UpdateReasonDidChangeCompilerOptionsForInferredProjects:
 			logger.Logf("Reason: DidChangeCompilerOptionsForInferredProjects")
 		case UpdateReasonRequestedLanguageServicePendingChanges:
@@ -278,10 +317,21 @@ func (s *Snapshot) Clone(ctx context.Context, change SnapshotChange, overlays ma
 			logger.Logf("Reason: RequestedLoadProjectTree - %v", getDetails())
 		case UpdateReasonIdleCleanDiskCache:
 			logger.Logf("Reason: IdleCleanDiskCache")
+		case UpdateReasonDidChangeConfigFile:
+			logger.Logf("Reason: DidChangeConfigFile - %v", getDetails())
+		case UpdateReasonDidChangeContentMapperContributions:
+			logger.Logf("Reason: DidChangeContentMapperContributions - %v", getDetails())
 		}
 	}
 
 	start := time.Now()
+	configuredContentMappers := s.ConfigFileRegistry.contentMappers()
+	inferredContentMappers := s.inferredProjectContentMappers
+	inferredContentMapperExtensions := s.inferredProjectContentMapperExtensions
+	if change.contentMapperContributions != nil {
+		inferredContentMappers = change.contentMapperContributions.Mappers
+		inferredContentMapperExtensions = change.contentMapperContributions.Extensions
+	}
 	fs := newSnapshotFSBuilder(session.fs.fs, s.fs.overlays, overlays, s.fs.diskFiles, s.fs.diskDirectories, s.fs.nodeModulesRealpathAliases, session.options.PositionEncoding, s.toPath)
 	if change.fileChanges.HasExcessiveWatchEvents() {
 		invalidateStart := time.Now()
@@ -300,9 +350,19 @@ func (s *Snapshot) Clone(ctx context.Context, change SnapshotChange, overlays ma
 			logger.Logf("npm install detected, invalidated node_modules cache in %v", time.Since(invalidateStart))
 		}
 	} else {
-		change.fileChanges = fs.expandAndFilterWatchEvents(change.fileChanges)
+		var contentMapperExtensions []string
+		if change.contentMapperContributions == nil {
+			contentMapperExtensions, _ = s.contentMapperWatchState()
+		} else {
+			if configuredContentMappers != nil {
+				contentMapperExtensions = slices.Clone(configuredContentMappers.extensions)
+			}
+			contentMapperExtensions = append(contentMapperExtensions, inferredContentMapperExtensions...)
+		}
+		_, contentMapperWatchedFiles := s.contentMapperWatchState()
+		change.fileChanges = fs.expandAndFilterWatchEvents(change.fileChanges, contentMapperExtensions, contentMapperWatchedFiles)
 		change.fileChanges = s.fs.expandRealpathAliases(change.fileChanges)
-		fs.markDirtyFiles(change.fileChanges)
+		change.fileChanges = fs.markDirtyFiles(change.fileChanges)
 		change.fileChanges = fs.convertOpenAndCloseToChanges(change.fileChanges)
 	}
 
@@ -325,12 +385,16 @@ func (s *Snapshot) Clone(ctx context.Context, change SnapshotChange, overlays ma
 		fs,
 		s.ProjectCollection,
 		s.ConfigFileRegistry,
-		s.ProjectCollection.apiOpenedProjects,
+		s.ProjectCollection.apiState,
 		compilerOptionsForInferredProjects,
+		inferredContentMappers,
+		inferredContentMapperExtensions,
 		s.sessionOptions,
 		customConfigFileName,
 		session.parseCache,
+		session.contentMappedParseCache,
 		session.extendedConfigCache,
+		session.contentMapperHost,
 		session.client,
 	)
 
@@ -339,6 +403,12 @@ func (s *Snapshot) Clone(ctx context.Context, change SnapshotChange, overlays ma
 	}
 
 	projectCollectionBuilder.DidChangeCustomConfigFileName(logger.Fork("DidChangeCustomConfigFileName"))
+	if change.contentMapperContributions != nil {
+		projectCollectionBuilder.DidChangeContentMapperContributions(logger.Fork("DidChangeContentMapperContributions"))
+	}
+	if change.newConfig != nil {
+		projectCollectionBuilder.DidChangeUserPreferences(s.userPreferences, *change.newConfig, logger.Fork("DidChangeUserPreferences"))
+	}
 
 	if !change.fileChanges.IsEmpty() {
 		projectCollectionBuilder.DidChangeFiles(change.fileChanges, logger.Fork("DidChangeFiles"))
@@ -456,6 +526,8 @@ func (s *Snapshot) Clone(ctx context.Context, change SnapshotChange, overlays ma
 	newSnapshot.parentId = s.id
 	newSnapshot.ProjectCollection = projectCollection
 	newSnapshot.ConfigFileRegistry = configFileRegistry
+	newSnapshot.inferredProjectContentMappers = inferredContentMappers
+	newSnapshot.inferredProjectContentMapperExtensions = inferredContentMapperExtensions
 	newSnapshot.builderLogs = logger
 	newSnapshot.apiError = apiError
 
@@ -533,11 +605,33 @@ func (s *Snapshot) Deref(session *Session) {
 func (s *Snapshot) dispose(session *Session) {
 	for _, project := range s.ProjectCollection.Projects() {
 		if project.Program != nil && session.programCounter.Deref(project.Program) {
+			if contentMapperProject := project.Program.ContentMapperProject(); contentMapperProject != nil {
+				_ = contentMapperProject.Close()
+			}
+			// This program is no longer referenced by any snapshot.
+			// Mark its checker pool as discarded so its idle-cleanup timer stops
+			// keeping the pool alive, allowing the pool and any idle checkers it
+			// still references to be reclaimed when the pool is garbage-collected.
+			if project.checkerPool != nil {
+				project.checkerPool.Discard()
+			}
 			for _, file := range project.Program.SourceFiles() {
-				session.parseCache.Deref(NewParseCacheKey(file.ParseOptions(), file.Hash, file.ScriptKind))
+				if !file.IsContentMapperFailureStub() && !file.IsContentMapperSupplemental() {
+					if file.ContentMapper() != "" {
+						session.contentMappedParseCache.Deref(contentMappedParseCacheKeyForFile(file))
+					} else {
+						session.parseCache.Deref(parseCacheKeyForFile(file))
+					}
+				}
 			}
 			for _, file := range project.Program.DuplicateSourceFiles() {
-				session.parseCache.Deref(NewParseCacheKey(file.ParseOptions, file.Hash, file.ScriptKind))
+				if !file.IsContentMapperFailureStub {
+					if file.ContentMapper != "" {
+						session.contentMappedParseCache.Deref(contentMappedParseCacheKeyForDuplicate(file))
+					} else {
+						session.parseCache.Deref(parseCacheKeyForDuplicate(file))
+					}
+				}
 			}
 		}
 	}

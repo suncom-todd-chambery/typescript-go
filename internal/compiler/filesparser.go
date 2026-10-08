@@ -11,6 +11,7 @@ import (
 	"github.com/microsoft/typescript-go/internal/core"
 	"github.com/microsoft/typescript-go/internal/diagnostics"
 	"github.com/microsoft/typescript-go/internal/module"
+	"github.com/microsoft/typescript-go/internal/tracing"
 	"github.com/microsoft/typescript-go/internal/tsoptions"
 	"github.com/microsoft/typescript-go/internal/tspath"
 )
@@ -25,6 +26,8 @@ type parseTask struct {
 	loaded                      bool
 	startedSubTasks             bool
 	isForAutomaticTypeDirective bool
+	isContentMapperSupplemental bool
+	failedLookup                bool
 	includeReason               *FileIncludeReason
 	packageId                   module.PackageId
 
@@ -59,13 +62,21 @@ func (t *parseTask) load(loader *fileLoader) {
 		t.loadAutomaticTypeDirectives(loader)
 		return
 	}
+	if t.failedLookup {
+		// The root file name did not resolve to a supported extension; the task
+		// exists only to carry its processing diagnostic, so nothing is parsed.
+		return
+	}
+	if loader.opts.Tracing != nil {
+		defer loader.opts.Tracing.Push(tracing.PhaseProgram, "findSourceFile", map[string]any{"fileName": t.normalizedFilePath}, false)()
+	}
 	redirect := loader.projectReferenceFileMapper.getParseFileRedirect(t)
 	if redirect != "" {
 		t.redirect(loader, redirect)
 		return
 	}
 
-	if tspath.HasExtension(t.normalizedFilePath) {
+	if !t.isContentMapperSupplemental && tspath.HasExtension(t.normalizedFilePath) {
 		compilerOptions := loader.opts.Config.CompilerOptions()
 		allowNonTsExtensions := compilerOptions.AllowNonTsExtensions.IsTrue()
 		if !allowNonTsExtensions {
@@ -105,12 +116,18 @@ func (t *parseTask) load(loader *fileLoader) {
 		t.metadata = loader.loadSourceFileMetaData(t.normalizedFilePath)
 	}
 
-	file := loader.parseSourceFile(t)
+	file := t.file
+	if file == nil {
+		file = loader.parseSourceFile(t)
+	}
 	if file == nil {
 		return
 	}
 
 	t.file = file
+	if virtualFileName := file.VirtualFileName(); virtualFileName != "" {
+		t.metadata.ImpliedNodeFormat = ast.GetImpliedNodeFormatForFile(virtualFileName, t.metadata.PackageJsonType)
+	}
 	t.subTasks = make([]*parseTask, 0, len(file.ReferencedFiles)+len(file.Imports())+len(file.ModuleAugmentations))
 
 	compilerOptions := loader.opts.Config.CompilerOptions()
@@ -152,6 +169,17 @@ func (t *parseTask) load(loader *fileLoader) {
 	}
 
 	loader.resolveImportsAndModuleAugmentations(t)
+	for _, supplemental := range file.SupplementalSourceFiles() {
+		t.subTasks = append(t.subTasks, &parseTask{
+			normalizedFilePath:          supplemental.FileName(),
+			file:                        supplemental,
+			isContentMapperSupplemental: true,
+			includeReason: &FileIncludeReason{
+				kind: fileIncludeKindContentMapperSupplemental,
+				data: t.path,
+			},
+		})
+	}
 }
 
 func (t *parseTask) redirect(loader *fileLoader, fileName string) {
@@ -165,6 +193,9 @@ func (t *parseTask) redirect(loader *fileLoader, fileName string) {
 }
 
 func (t *parseTask) loadAutomaticTypeDirectives(loader *fileLoader) {
+	if loader.opts.Tracing != nil {
+		defer loader.opts.Tracing.Push(tracing.PhaseProgram, "processTypeReferences", nil, false)()
+	}
 	toParseTypeRefs, typeResolutionsInFile, typeResolutionsTrace, pDiagnostics := loader.resolveAutomaticTypeDirectives(t.normalizedFilePath)
 	t.typeResolutionsInFile = typeResolutionsInFile
 	t.typeResolutionsTrace = typeResolutionsTrace
@@ -337,6 +368,14 @@ func (w *filesParser) getProcessedFiles(loader *fileLoader) processedFiles {
 	}
 
 	var collectFiles func(tasks []*parseTask, seen map[*parseTaskData]string)
+	// recordedDuplicates tracks, per task data, the set of file-name casings that
+	// have already been recorded in duplicateSourceFiles. A file that is reached
+	// from multiple import sites is walked once per site, but each distinct casing
+	// is only parsed and acquired in the parse cache once. Recording the same casing
+	// as a duplicate more than once would cause it to be released more times than it
+	// was acquired when the snapshot is disposed, leaving a dangling cache entry that
+	// panics the next time it is referenced.
+	var recordedDuplicates map[*parseTaskData]*collections.Set[string]
 	collectFiles = func(tasks []*parseTask, seen map[*parseTaskData]string) {
 		for _, task := range tasks {
 			includeReason := task.includeReason
@@ -357,11 +396,24 @@ func (w *filesParser) getProcessedFiles(loader *fileLoader) processedFiles {
 			// ensure we only walk each task once
 			if checkedName, ok := seen[data]; ok {
 				if task.file != nil && checkedName != task.normalizedFilePath {
-					duplicateSourceFiles = append(duplicateSourceFiles, &DuplicateSourceFile{
-						ParseOptions: task.file.ParseOptions(),
-						Hash:         task.file.Hash,
-						ScriptKind:   task.file.ScriptKind,
-					})
+					if recordedDuplicates == nil {
+						recordedDuplicates = make(map[*parseTaskData]*collections.Set[string])
+					}
+					dups := recordedDuplicates[data]
+					if dups == nil {
+						dups = &collections.Set[string]{}
+						recordedDuplicates[data] = dups
+					}
+					if dups.AddIfAbsent(task.normalizedFilePath) {
+						duplicateSourceFiles = append(duplicateSourceFiles, &DuplicateSourceFile{
+							ParseOptions:               task.file.ParseOptions(),
+							ContentMapperParseOptions:  task.file.ContentMapperParseOptions(),
+							Hash:                       task.file.Hash,
+							ScriptKind:                 task.file.ScriptKind,
+							ContentMapper:              task.file.ContentMapper(),
+							IsContentMapperFailureStub: task.file.IsContentMapperFailureStub(),
+						})
+					}
 				}
 				if !loader.opts.Config.CompilerOptions().ForceConsistentCasingInFileNames.IsFalse() {
 					// Check if it differs only in drive letters its ok to ignore that error:
@@ -400,9 +452,12 @@ func (w *filesParser) getProcessedFiles(loader *fileLoader) processedFiles {
 						// program, but we still parsed this file and acquired it through
 						// the host, so snapshot disposal must release that extra owner.
 						duplicateSourceFiles = append(duplicateSourceFiles, &DuplicateSourceFile{
-							ParseOptions: file.ParseOptions(),
-							Hash:         file.Hash,
-							ScriptKind:   file.ScriptKind,
+							ParseOptions:               file.ParseOptions(),
+							ContentMapperParseOptions:  file.ContentMapperParseOptions(),
+							Hash:                       file.Hash,
+							ScriptKind:                 file.ScriptKind,
+							ContentMapper:              file.ContentMapper(),
+							IsContentMapperFailureStub: file.IsContentMapperFailureStub(),
 						})
 					}
 					redirectTargetsMap[packageIdFile.Path()] = append(redirectTargetsMap[packageIdFile.Path()], task.normalizedFilePath)
@@ -526,6 +581,7 @@ func (w *filesParser) getProcessedFiles(loader *fileLoader) processedFiles {
 		outputFileToProjectReferenceSource:   outputFileToProjectReferenceSource,
 		redirectTargetsMap:                   redirectTargetsMap,
 		redirectFilesByPath:                  redirectFilesByPath,
+		contentMapperDiagnostics:             loader.contentMapperDiagnostics,
 	}
 }
 

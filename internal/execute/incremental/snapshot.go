@@ -138,6 +138,8 @@ type buildInfoDiagnosticWithFileName struct {
 	end                int
 	code               int32
 	category           diagnostics.Category
+	source             string
+	messageText        string
 	messageKey         diagnostics.Key
 	messageArgs        []string
 	messageChain       []*buildInfoDiagnosticWithFileName
@@ -173,7 +175,7 @@ func (b *buildInfoDiagnosticWithFileName) toDiagnostic(p *compiler.Program, file
 	for _, info := range b.relatedInformation {
 		relatedInformation = append(relatedInformation, info.toDiagnostic(p, fileForDiagnostic))
 	}
-	return ast.NewDiagnosticFromSerialized(
+	diagnostic := ast.NewDiagnosticFromSerialized(
 		fileForDiagnostic,
 		core.NewTextRange(b.pos, b.end),
 		b.code,
@@ -186,6 +188,10 @@ func (b *buildInfoDiagnosticWithFileName) toDiagnostic(p *compiler.Program, file
 		b.reportsDeprecated,
 		b.skippedOnNoEmit,
 	)
+	if b.source != "" || b.messageText != "" {
+		diagnostic.SetExternalData(b.source, b.messageText)
+	}
+	return diagnostic
 }
 
 // repopulateDiagnosticChain recomputes a diagnostic chain entry that depends on
@@ -323,6 +329,9 @@ type snapshot struct {
 	hasSemanticErrors bool
 	// If semantic diagnostic check is pending
 	checkPending bool
+	// Looked up package.json files from
+	packageJsons        []string
+	missingPackageJsons []string
 
 	// Additional fields that are not serialized but needed to track state
 
@@ -331,6 +340,8 @@ type snapshot struct {
 	hasErrorsFromOldState                   core.Tristate
 	hasSemanticErrorsFromOldState           bool
 	allFilesExcludingDefaultLibraryFileOnce sync.Once
+	packageJsonsFromOldState                []string
+	missingPackageJsonsFromOldState         []string
 	//  Cache of all files excluding default library file for the current program
 	allFilesExcludingDefaultLibraryFile []*ast.SourceFile
 	hasChangedDtsFile                   bool

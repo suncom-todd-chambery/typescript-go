@@ -15,6 +15,7 @@ import (
 	"github.com/microsoft/typescript-go/internal/debug"
 	"github.com/microsoft/typescript-go/internal/ls/lsconv"
 	"github.com/microsoft/typescript-go/internal/lsp/lsproto"
+	"github.com/microsoft/typescript-go/internal/spanmap"
 	"github.com/microsoft/typescript-go/internal/stringutil"
 	"github.com/microsoft/typescript-go/internal/testutil/baseline"
 	"github.com/microsoft/typescript-go/internal/vfs"
@@ -26,6 +27,7 @@ const (
 	closingTagCmd               baselineCommand = "Closing Tag"
 	documentHighlightsCmd       baselineCommand = "documentHighlights"
 	findAllReferencesCmd        baselineCommand = "findAllReferences"
+	vsFindAllReferencesCmd      baselineCommand = "vsFindAllReferences"
 	goToDefinitionCmd           baselineCommand = "goToDefinition"
 	goToImplementationCmd       baselineCommand = "goToImplementation"
 	goToSourceDefinitionCmd     baselineCommand = "goToSourceDefinition"
@@ -33,6 +35,7 @@ const (
 	inlayHintsCmd               baselineCommand = "Inlay Hints"
 	nonSuggestionDiagnosticsCmd baselineCommand = "Syntax and Semantic Diagnostics"
 	quickInfoCmd                baselineCommand = "QuickInfo"
+	vsQuickInfoCmd              baselineCommand = "VSQuickInfo"
 	linkedEditingCmd            baselineCommand = "linkedEditing"
 	renameCmd                   baselineCommand = "findRenameLocations"
 	signatureHelpCmd            baselineCommand = "SignatureHelp"
@@ -78,7 +81,7 @@ func getBaselineFileName(t *testing.T, command baselineCommand) string {
 
 func getBaselineExtension(command baselineCommand) string {
 	switch command {
-	case quickInfoCmd, signatureHelpCmd, smartSelectionCmd, inlayHintsCmd, nonSuggestionDiagnosticsCmd, documentSymbolsCmd, closingTagCmd:
+	case quickInfoCmd, vsQuickInfoCmd, signatureHelpCmd, smartSelectionCmd, inlayHintsCmd, nonSuggestionDiagnosticsCmd, documentSymbolsCmd, closingTagCmd, vsFindAllReferencesCmd:
 		return "baseline"
 	case callHierarchyCmd:
 		return "callHierarchy.txt"
@@ -741,7 +744,8 @@ func (f *FourslashTest) getBaselineContentForFile(
 		if options.getLocationData != nil {
 			startMarker += options.getLocationData(span)
 		}
-		details = append(details,
+		details = append(
+			details,
 			&baselineDetail{pos: span.textSpan.Start, positionMarker: startMarker, span: &span, kind: detailKindTextStart},
 			&baselineDetail{pos: span.textSpan.End, positionMarker: core.OrElse(options.endMarker, "|]"), span: &span, kind: detailKindTextEnd},
 		)
@@ -922,7 +926,7 @@ type textWithContext struct {
 	fileName   string
 	content    string // content of the original file
 	lineStarts *lsconv.LSPLineMap
-	converters *lsconv.Converters
+	converters *testConverters
 
 	// posLineInfo
 	posInfo  *lsproto.Position
@@ -935,9 +939,18 @@ func (t *textWithContext) FileName() string {
 }
 
 // implements lsconv.Script
+func (t *textWithContext) OriginalFileName() string { return t.fileName }
+
+// implements lsconv.Script
 func (t *textWithContext) Text() string {
 	return t.content
 }
+
+// implements lsconv.Script
+func (t *textWithContext) OriginalText() string { return t.content }
+
+// implements lsconv.Script
+func (t *textWithContext) SpanMap() *spanmap.SpanMap { return nil }
 
 func newTextWithContext(fileName string, content string) *textWithContext {
 	t := &textWithContext{
@@ -953,9 +966,9 @@ func newTextWithContext(fileName string, content string) *textWithContext {
 		lineStarts: lsconv.ComputeLSPLineStarts(content),
 	}
 
-	t.converters = lsconv.NewConverters(lsproto.PositionEncodingKindUTF8, func(_ string) *lsconv.LSPLineMap {
+	t.converters = newTestConverters(lsconv.NewConverters(lsproto.PositionEncodingKindUTF8, func(_ string) *lsconv.LSPLineMap {
 		return t.lineStarts
-	})
+	}))
 	t.readableContents.WriteString("// === ")
 	t.readableContents.WriteString(fileName)
 	t.readableContents.WriteString(" ===")

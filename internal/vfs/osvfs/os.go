@@ -12,6 +12,8 @@ import (
 	"unicode"
 
 	"github.com/microsoft/typescript-go/internal/core"
+	"github.com/microsoft/typescript-go/internal/nativepath"
+	"github.com/microsoft/typescript-go/internal/osutil"
 	"github.com/microsoft/typescript-go/internal/tspath"
 	"github.com/microsoft/typescript-go/internal/vfs"
 	"github.com/microsoft/typescript-go/internal/vfs/internal"
@@ -57,7 +59,7 @@ var isFileSystemCaseSensitive = func() bool {
 	// As a proxy for case-insensitivity, we check if the current executable exists under a different case.
 	// This is not entirely correct, since different OSs can have differing case sensitivity in different paths,
 	// but this is largely good enough for our purposes (and what sys.ts used to do with __filename).
-	exe, err := os.Executable()
+	exe, err := osutil.Executable()
 	if err != nil {
 		panic(fmt.Sprintf("vfs: failed to get executable path: %v", err))
 	}
@@ -159,7 +161,7 @@ func osFSRealpath(path string) string {
 
 	orig := path
 	path = filepath.FromSlash(path)
-	path, err := realpath(path)
+	path, err := nativepath.Realpath(path)
 	if err != nil {
 		return orig
 	}
@@ -170,10 +172,14 @@ func osFSRealpath(path string) string {
 	return tspath.NormalizeSlashes(path)
 }
 
-func (vfs *osFS) writeFile(path string, content string) error {
+func isReparsePoint(path string) bool {
+	return nativepath.IsSymlinkOrReparsePoint(filepath.FromSlash(path))
+}
+
+func (vfs *osFS) writeFileWithFlag(path string, content string, flag int) error {
 	defer writeSema.Acquire()()
 
-	file, err := os.Create(path)
+	file, err := os.OpenFile(path, flag, 0o666)
 	if err != nil {
 		return err
 	}
@@ -191,15 +197,23 @@ func (vfs *osFS) ensureDirectoryExists(directoryPath string) error {
 	return os.MkdirAll(directoryPath, 0o777)
 }
 
-func (vfs *osFS) WriteFile(path string, content string) error {
+func (vfs *osFS) writeFileEnsuringDir(path string, content string, flag int) error {
 	_ = internal.RootLength(path) // Assert path is rooted
-	if err := vfs.writeFile(path, content); err == nil {
+	if err := vfs.writeFileWithFlag(path, content, flag); err == nil {
 		return nil
 	}
 	if err := vfs.ensureDirectoryExists(tspath.GetDirectoryPath(tspath.NormalizePath(path))); err != nil {
 		return err
 	}
-	return vfs.writeFile(path, content)
+	return vfs.writeFileWithFlag(path, content, flag)
+}
+
+func (vfs *osFS) WriteFile(path string, content string) error {
+	return vfs.writeFileEnsuringDir(path, content, os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
+}
+
+func (vfs *osFS) AppendFile(path string, content string) error {
+	return vfs.writeFileEnsuringDir(path, content, os.O_WRONLY|os.O_CREATE|os.O_APPEND)
 }
 
 func (vfs *osFS) Remove(path string) error {

@@ -14,6 +14,7 @@ import (
 	"github.com/microsoft/typescript-go/internal/locale"
 	"github.com/microsoft/typescript-go/internal/ls/lsconv"
 	"github.com/microsoft/typescript-go/internal/lsp/lsproto"
+	"github.com/microsoft/typescript-go/internal/spanmap"
 )
 
 // CodeFixProvider represents a provider for a specific type of code fix
@@ -70,6 +71,7 @@ type CombinedCodeActions struct {
 var codeFixProviders = []*CodeFixProvider{
 	ImportFixProvider,
 	IsolatedDeclarationsFixProvider,
+	FixClassIncorrectlyImplementsInterfaceProvider,
 	// Add more code fix providers here as they are implemented
 }
 
@@ -102,6 +104,8 @@ func (l *LanguageService) ProvideCodeActions(ctx context.Context, params *lsprot
 	if params.Context != nil && params.Context.Diagnostics != nil && wantsQuickFixes(params.Context.Only) {
 		fixIdSeen := make(map[string]*CodeFixProvider)
 
+		var seen []*CodeAction // sorted for binary search dedup, dedup across all diagnostics and providers so if multiple diags produce the same codefix, only one is returned
+
 		for _, diag := range params.Context.Diagnostics {
 			if diag.Code == nil || diag.Code.Integer == nil {
 				continue
@@ -110,30 +114,35 @@ func (l *LanguageService) ProvideCodeActions(ctx context.Context, params *lsprot
 			errorCode := *diag.Code.Integer
 
 			for _, provider := range codeFixProviders {
-				if !containsErrorCode(provider.ErrorCodes, errorCode) {
+				if !codeFixProviderMatchesLSPDiagnostic(provider, diag) {
 					continue
 				}
 
-				position := l.converters.LineAndCharacterToPosition(file, diag.Range.Start)
-				endPosition := l.converters.LineAndCharacterToPosition(file, diag.Range.End)
-				fixContext := &CodeFixContext{
-					SourceFile: file,
-					Span:       core.NewTextRange(int(position), int(endPosition)),
-					ErrorCode:  errorCode,
-					Program:    program,
-					LS:         l,
-					Diagnostic: diag,
-					Params:     params,
-				}
+				for _, mapped := range lsconv.FromLSPRangeForSourceFile(l.converters, file, diag.Range, spanmap.FeatureCodeActions) {
+					fixContext := &CodeFixContext{
+						SourceFile: mapped.Script,
+						Span:       mapped.Span,
+						ErrorCode:  errorCode,
+						Program:    program,
+						LS:         l,
+						Diagnostic: diag,
+						Params:     params,
+					}
 
-				providerActions, err := provider.GetCodeActions(ctx, fixContext)
-				if err != nil {
-					return lsproto.CodeActionResponse{}, err
-				}
-				for _, action := range providerActions {
-					actions = append(actions, convertToLSPCodeAction(action, diag, params.TextDocument.Uri))
-					if action.FixID != "" {
-						fixIdSeen[action.FixID] = provider
+					providerActions, err := provider.GetCodeActions(ctx, fixContext)
+					if err != nil {
+						return lsproto.CodeActionResponse{}, err
+					}
+					for _, action := range providerActions {
+						i, found := slices.BinarySearchFunc(seen, action, (*CodeAction).Compare)
+						if found {
+							continue
+						}
+						seen = slices.Insert(seen, i, action)
+						actions = append(actions, convertToLSPCodeAction(action, diag, params.TextDocument.Uri))
+						if action.FixID != "" {
+							fixIdSeen[action.FixID] = provider
+						}
 					}
 				}
 			}
@@ -210,7 +219,7 @@ func hasMultipleFixableDiagnostics(ctx context.Context, program *compiler.Progra
 	allDiags := getAllDiagnostics(ctx, program, file)
 	count := 0
 	for _, d := range allDiags {
-		if containsErrorCode(errorCodes, d.Code()) {
+		if isFixableDiagnostic(d, errorCodes) {
 			count++
 			if count >= 2 {
 				return true
@@ -218,6 +227,17 @@ func hasMultipleFixableDiagnostics(ctx context.Context, program *compiler.Progra
 		}
 	}
 	return false
+}
+
+func codeFixProviderMatchesLSPDiagnostic(provider *CodeFixProvider, diagnostic *lsproto.Diagnostic) bool {
+	if diagnostic.Source != nil && *diagnostic.Source != "ts" {
+		return false
+	}
+	return diagnostic.Code != nil && diagnostic.Code.Integer != nil && containsErrorCode(provider.ErrorCodes, *diagnostic.Code.Integer)
+}
+
+func isFixableDiagnostic(diagnostic *ast.Diagnostic, errorCodes []int32) bool {
+	return diagnostic.Source() == "" && containsErrorCode(errorCodes, diagnostic.Code())
 }
 
 // codeActionKindContains returns true if the requested kind equals or is a

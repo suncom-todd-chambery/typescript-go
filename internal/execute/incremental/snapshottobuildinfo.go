@@ -15,9 +15,14 @@ import (
 	"github.com/microsoft/typescript-go/internal/tspath"
 )
 
-func snapshotToBuildInfo(snapshot *snapshot, program *compiler.Program, buildInfoFileName string) *BuildInfo {
+func snapshotToBuildInfo(snapshot *snapshot, program *compiler.Program, buildInfoFileName string) (*BuildInfo, error) {
+	contentMapperIdentities, err := ContentMapperIdentities(program.ContentMapperProject())
+	if err != nil {
+		return nil, err
+	}
 	buildInfo := &BuildInfo{
-		Version: core.Version(),
+		Version:                 core.Version(),
+		ContentMapperIdentities: contentMapperIdentities,
 	}
 	to := &toBuildInfo{
 		snapshot:           snapshot,
@@ -52,7 +57,8 @@ func snapshotToBuildInfo(snapshot *snapshot, program *compiler.Program, buildInf
 	buildInfo.Errors = snapshot.hasErrors.IsTrue()
 	buildInfo.SemanticErrors = snapshot.hasSemanticErrors
 	buildInfo.CheckPending = snapshot.checkPending
-	return buildInfo
+	to.setPackageJsons()
+	return buildInfo, nil
 }
 
 type toBuildInfo struct {
@@ -128,6 +134,8 @@ func (t *toBuildInfo) toBuildInfoDiagnosticsFromFileNameDiagnostics(diagnostics 
 			End:                d.end,
 			Code:               d.code,
 			Category:           d.category,
+			Source:             d.source,
+			MessageText:        d.messageText,
 			MessageKey:         d.messageKey,
 			MessageArgs:        d.messageArgs,
 			MessageChain:       t.toBuildInfoDiagnosticsFromFileNameDiagnostics(d.messageChain),
@@ -156,6 +164,8 @@ func (t *toBuildInfo) toBuildInfoDiagnosticsFromDiagnostics(filePath tspath.Path
 			End:                d.Loc().End(),
 			Code:               d.Code(),
 			Category:           d.Category(),
+			Source:             d.Source(),
+			MessageText:        d.MessageText(),
 			MessageKey:         d.MessageKey(),
 			MessageArgs:        d.MessageArgs(),
 			MessageChain:       t.toBuildInfoDiagnosticsFromDiagnostics(filePath, d.MessageChain()),
@@ -368,4 +378,13 @@ func (t *toBuildInfo) setRootOfNonIncrementalProgram() {
 			NonIncremental: t.relativeToBuildInfo(string(tspath.ToPath(fileName, t.comparePathsOptions.CurrentDirectory, t.comparePathsOptions.UseCaseSensitiveFileNames))),
 		}
 	})
+}
+
+func (t *toBuildInfo) setPackageJsons() {
+	if len(t.snapshot.packageJsons) > 0 {
+		t.buildInfo.PackageJsons = core.Map(t.snapshot.packageJsons, t.relativeToBuildInfo)
+	}
+	if len(t.snapshot.missingPackageJsons) > 0 {
+		t.buildInfo.MissingPackageJsons = core.Map(t.snapshot.missingPackageJsons, t.relativeToBuildInfo)
+	}
 }

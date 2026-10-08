@@ -1,6 +1,7 @@
 package tsctests
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"maps"
@@ -16,7 +17,9 @@ import (
 	"github.com/microsoft/typescript-go/internal/execute"
 	"github.com/microsoft/typescript-go/internal/execute/incremental"
 	"github.com/microsoft/typescript-go/internal/execute/tsc"
+	"github.com/microsoft/typescript-go/internal/execute/watchmanager"
 	"github.com/microsoft/typescript-go/internal/locale"
+	"github.com/microsoft/typescript-go/internal/testutil/contentmappertest"
 	"github.com/microsoft/typescript-go/internal/testutil/fsbaselineutil"
 	"github.com/microsoft/typescript-go/internal/testutil/harnessutil"
 	"github.com/microsoft/typescript-go/internal/testutil/stringtestutil"
@@ -102,7 +105,7 @@ func GetFileMapWithBuild(files FileMap, commandLineArgs []string) FileMap {
 	sys := newTestSys(&tscInput{
 		files: maps.Clone(files),
 	}, false)
-	execute.CommandLine(sys, commandLineArgs, sys)
+	execute.CommandLine(context.Background(), sys, commandLineArgs, sys)
 	sys.fs.writtenFiles.Range(func(key string) bool {
 		if text, ok := sys.fsFromFileMap().ReadFile(key); ok {
 			files[key] = text
@@ -131,6 +134,9 @@ func newTestSys(tscInput *tscInput, forIncrementalCorrectness bool) *TestSys {
 	}, currentWrite)
 	sys.env = tscInput.env
 	sys.forIncrementalCorrectness = forIncrementalCorrectness
+	sys.mockWatchBackend = NewMockWatchBackend()
+	sys.mockWatchBackend.DirectoryExists = sys.fs.FS.DirectoryExists
+	sys.mockWatchBackend.UseCaseSensitiveFileNames = !tscInput.ignoreCase
 	sys.fsDiffer = &fsbaselineutil.FSDiffer{
 		FS:           sys.fs.FS.(iovfs.FsWithSys),
 		DefaultLibs:  func() *collections.SyncSet[string] { return sys.fs.defaultLibs },
@@ -155,6 +161,7 @@ type TestSys struct {
 	tracer                    *harnessutil.TracerForBaselining
 	fsDiffer                  *fsbaselineutil.FSDiffer
 	forIncrementalCorrectness bool
+	mockWatchBackend          *MockWatchBackend
 
 	fs                 *testFs
 	defaultLibraryPath string
@@ -214,6 +221,10 @@ func (s *TestSys) Writer() io.Writer {
 	return s.currentWrite
 }
 
+func (s *TestSys) ErrorWriter() io.Writer {
+	return s.currentWrite
+}
+
 func (s *TestSys) WriteOutputIsTTY() bool {
 	return true
 }
@@ -227,6 +238,13 @@ func (s *TestSys) GetWidthOfTerminal() int {
 
 func (s *TestSys) GetEnvironmentVariable(name string) string {
 	return s.env[name]
+}
+
+// Spawn serves the fake content mappers in-process, selecting the implementation by the exec command the
+// mapper package declares (see internal/testutil/contentmappertest), so tests exercise the full IPC stack
+// without spawning a subprocess.
+func (s *TestSys) Spawn(command []string, dir string, stderr io.Writer) (io.ReadWriteCloser, error) {
+	return contentmappertest.NewSpawner().Spawn(command, dir, stderr)
 }
 
 func (s *TestSys) OnEmittedFiles(result *compiler.EmitResult, mTimesCache *collections.SyncMap[tspath.Path, time.Time]) {
@@ -311,6 +329,10 @@ func (s *TestSys) writeHeaderToBaseline(builder *strings.Builder, program *incre
 		}))
 		builder.WriteString("::\n")
 	}
+}
+
+func (s *TestSys) WatchBackend() watchmanager.WatchBackend {
+	return s.mockWatchBackend
 }
 
 func (s *TestSys) OnProgram(program *incremental.Program) {

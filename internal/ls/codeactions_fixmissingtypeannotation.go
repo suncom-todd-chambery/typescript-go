@@ -2,7 +2,6 @@ package ls
 
 import (
 	"context"
-	"slices"
 	"strconv"
 
 	"github.com/microsoft/typescript-go/internal/ast"
@@ -27,7 +26,7 @@ var isolatedDeclarationsFixErrorCodes = []int32{
 	diagnostics.Parameter_must_have_an_explicit_type_annotation_with_isolatedDeclarations.Code(),
 	diagnostics.Property_must_have_an_explicit_type_annotation_with_isolatedDeclarations.Code(),
 	diagnostics.Expression_type_can_t_be_inferred_with_isolatedDeclarations.Code(),
-	diagnostics.Binding_elements_can_t_be_exported_directly_with_isolatedDeclarations.Code(),
+	diagnostics.Binding_elements_with_initializers_can_t_be_exported_directly_with_isolatedDeclarations.Code(),
 	diagnostics.Computed_property_names_on_class_or_object_literals_cannot_be_inferred_with_isolatedDeclarations.Code(),
 	diagnostics.Computed_properties_must_be_number_or_string_literals_variables_or_dotted_expressions_with_isolatedDeclarations.Code(),
 	diagnostics.Enum_member_initializers_must_be_computable_without_references_to_external_symbols_with_isolatedDeclarations.Code(),
@@ -91,17 +90,11 @@ func getIsolatedDeclarationsCodeActions(ctx context.Context, fixContext *CodeFix
 	defer done()
 
 	var fixes []*CodeAction
-	var seen []*CodeAction // sorted for binary search dedup
 
 	addFix := func(action *CodeAction) {
 		if action == nil {
 			return
 		}
-		i, found := slices.BinarySearchFunc(seen, action, (*CodeAction).Compare)
-		if found {
-			return
-		}
-		seen = slices.Insert(seen, i, action)
 		fixes = append(fixes, action)
 	}
 
@@ -150,7 +143,7 @@ func getAllIsolatedDeclarationsCodeActions(ctx context.Context, fixContext *Code
 
 	allDiags := getAllDiagnostics(ctx, fixContext.Program, fixContext.SourceFile)
 	for _, diag := range allDiags {
-		if containsErrorCode(isolatedDeclarationsFixErrorCodes, diag.Code()) {
+		if isFixableDiagnostic(diag, isolatedDeclarationsFixErrorCodes) {
 			span := core.NewTextRange(diag.Loc().Pos(), diag.Loc().End())
 			fixer.addTypeAnnotation(span)
 		}
@@ -160,8 +153,8 @@ func getAllIsolatedDeclarationsCodeActions(ctx context.Context, fixContext *Code
 		fixer.addSymbolToExistingImport(sym)
 	}
 
-	changes := changeTracker.GetChanges()
-	fileChanges := changes[fixContext.SourceFile.FileName()]
+	changes, _ := changeTracker.GetChanges()
+	fileChanges := changes[fixContext.SourceFile.OriginalFileName()]
 	if len(fileChanges) == 0 {
 		return nil, nil
 	}
@@ -199,8 +192,8 @@ func tryCodeAction(ctx context.Context, fixContext *CodeFixContext, ch *checker.
 		fixer.addSymbolToExistingImport(sym)
 	}
 
-	changes := changeTracker.GetChanges()
-	fileChanges := changes[fixContext.SourceFile.FileName()]
+	changes, _ := changeTracker.GetChanges()
+	fileChanges := changes[fixContext.SourceFile.OriginalFileName()]
 
 	// Add import edits if import adder has fixes
 	if importAdder != nil && importAdder.HasFixes() {
@@ -940,7 +933,8 @@ func (f *isolatedDeclarationsFixer) getExtraFlags(node *ast.Node, t *checker.Typ
 // createTypeOfFromEntityNameExpression creates a `typeof X` type query node.
 func (f *isolatedDeclarationsFixer) createTypeOfFromEntityNameExpression(node *ast.Node) *ast.TypeNode {
 	return f.changeTracker.NodeFactory.NewTypeQueryNode(
-		f.changeTracker.NodeFactory.DeepCloneNode(node), nil)
+		f.changeTracker.NodeFactory.DeepCloneNode(node), nil,
+	)
 }
 
 // typeFromArraySpreadElements decomposes an array literal with spread elements into

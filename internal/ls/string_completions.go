@@ -41,13 +41,17 @@ type pathCompletion struct {
 	name      string
 	kind      lsutil.ScriptElementKind
 	extension string
-	textRange *core.TextRange
+}
+
+type pathCompletions struct {
+	entries         []*pathCompletion
+	replacementSpan *lsproto.Range
 }
 
 type stringLiteralCompletions struct {
 	fromTypes      *completionsFromTypes
 	fromProperties *completionsFromProperties
-	fromPaths      []*pathCompletion
+	fromPaths      *pathCompletions
 }
 
 func (l *LanguageService) getStringLiteralCompletions(
@@ -57,10 +61,11 @@ func (l *LanguageService) getStringLiteralCompletions(
 	contextToken *ast.Node,
 	checker *checker.Checker,
 	compilerOptions *core.CompilerOptions,
-) *lsproto.CompletionList {
+	includeSymbols bool,
+) *CompletionList {
 	if isInReferenceComment(file, position) {
-		entries := l.getTripleSlashReferenceCompletions(file, position, l.GetProgram(), checker)
-		return l.convertPathCompletions(ctx, entries, file, position)
+		completion := l.getTripleSlashReferenceCompletions(file, position, l.GetProgram(), checker)
+		return l.convertPathCompletions(ctx, completion, file, position)
 	}
 	if IsInString(file, position, contextToken) {
 		if contextToken == nil || !ast.IsStringLiteralLike(contextToken) {
@@ -81,6 +86,7 @@ func (l *LanguageService) getStringLiteralCompletions(
 			position,
 			checker,
 			compilerOptions,
+			includeSymbols,
 		)
 	}
 	return nil
@@ -94,7 +100,8 @@ func (l *LanguageService) convertStringLiteralCompletions(
 	position int,
 	typeChecker *checker.Checker,
 	options *core.CompilerOptions,
-) *lsproto.CompletionList {
+	includeSymbols bool,
+) *CompletionList {
 	if completion == nil {
 		return nil
 	}
@@ -102,8 +109,7 @@ func (l *LanguageService) convertStringLiteralCompletions(
 	optionalReplacementRange := l.createRangeFromStringLiteralLikeContent(file, contextToken, position)
 	switch {
 	case completion.fromPaths != nil:
-		completion := completion.fromPaths
-		return l.convertPathCompletions(ctx, completion, file, position)
+		return l.convertPathCompletions(ctx, completion.fromPaths, file, position)
 	case completion.fromProperties != nil:
 		completion := completion.fromProperties
 		data := &completionDataData{
@@ -113,7 +119,7 @@ func (l *LanguageService) convertStringLiteralCompletions(
 			location:                file.AsNode(),
 			contextToken:            contextToken,
 		}
-		_, items := l.getCompletionEntriesFromSymbols(
+		_, items, err := l.getCompletionEntriesFromSymbols(
 			ctx,
 			typeChecker,
 			data,
@@ -121,7 +127,11 @@ func (l *LanguageService) convertStringLiteralCompletions(
 			position,
 			file,
 			options,
+			includeSymbols, /*includeSymbols*/
 		)
+		if err != nil {
+			panic(err)
+		}
 		defaultCommitCharacters := getDefaultCommitCharacters(completion.hasIndexSignature)
 		itemDefaults := l.setItemDefaults(
 			ctx,
@@ -131,7 +141,7 @@ func (l *LanguageService) convertStringLiteralCompletions(
 			&defaultCommitCharacters,
 			optionalReplacementRange,
 		)
-		return &lsproto.CompletionList{
+		return &CompletionList{
 			IsIncomplete: false,
 			ItemDefaults: itemDefaults,
 			Items:        items,
@@ -146,9 +156,9 @@ func (l *LanguageService) convertStringLiteralCompletions(
 		} else {
 			quoteChar = printer.QuoteCharDoubleQuote
 		}
-		items := core.Map(completion.types, func(t *checker.StringLiteralType) *lsproto.CompletionItem {
+		items := core.Map(completion.types, func(t *checker.StringLiteralType) *CompletionItem {
 			name := printer.EscapeString(t.AsLiteralType().Value().(string), quoteChar)
-			return l.createLSPCompletionItem(
+			lspItem := l.createLSPCompletionItem(
 				ctx,
 				name,
 				"", /*insertText*/
@@ -167,8 +177,12 @@ func (l *LanguageService) convertStringLiteralCompletions(
 				false, /*preselect*/
 				"",    /*source*/
 				nil,   /*autoImportEntryData*/
+				nil,   /*additionalTextEdits*/
 				nil,   /*detail*/
 			)
+			return &CompletionItem{
+				CompletionItem: lspItem,
+			}
 		})
 		defaultCommitCharacters := getDefaultCommitCharacters(completion.isNewIdentifier)
 		itemDefaults := l.setItemDefaults(
@@ -179,7 +193,7 @@ func (l *LanguageService) convertStringLiteralCompletions(
 			&defaultCommitCharacters,
 			nil, /*optionalReplacementSpan*/
 		)
-		return &lsproto.CompletionList{
+		return &CompletionList{
 			IsIncomplete: false,
 			ItemDefaults: itemDefaults,
 			Items:        items,
@@ -191,22 +205,21 @@ func (l *LanguageService) convertStringLiteralCompletions(
 
 func (l *LanguageService) convertPathCompletions(
 	ctx context.Context,
-	pathCompletions []*pathCompletion,
+	completion *pathCompletions,
 	file *ast.SourceFile,
 	position int,
-) *lsproto.CompletionList {
+) *CompletionList {
+	if completion == nil {
+		return nil
+	}
 	isNewIdentifierLocation := true // The user may type in a path that doesn't yet exist, creating a "new identifier" with respect to the collection of identifiers the server is aware of.
 	defaultCommitCharacters := getDefaultCommitCharacters(isNewIdentifierLocation)
-	items := core.Map(pathCompletions, func(pathCompletion *pathCompletion) *lsproto.CompletionItem {
-		var replacementSpan *lsproto.Range
-		if pathCompletion.textRange != nil {
-			replacementSpan = new(l.createLspRangeFromBounds(pathCompletion.textRange.Pos(), pathCompletion.textRange.End(), file))
-		}
+	items := core.Map(completion.entries, func(pathCompletion *pathCompletion) *CompletionItem {
 		detail := pathCompletion.name
 		if !strings.HasSuffix(pathCompletion.name, pathCompletion.extension) {
 			detail += pathCompletion.extension
 		}
-		return l.createLSPCompletionItem(
+		lspItem := l.createLSPCompletionItem(
 			ctx,
 			pathCompletion.name,
 			"", /*insertText*/
@@ -214,7 +227,7 @@ func (l *LanguageService) convertPathCompletions(
 			SortTextLocationPriority,
 			pathCompletion.kind,
 			kindModifiersFromExtension(pathCompletion.extension),
-			replacementSpan,
+			completion.replacementSpan,
 			nil, /*commitCharacters*/
 			nil, /*labelDetails*/
 			file,
@@ -225,8 +238,12 @@ func (l *LanguageService) convertPathCompletions(
 			false, /*preselect*/
 			"",    /*source*/
 			nil,   /*autoImportEntryData*/
+			nil,   /*additionalTextEdits*/
 			&detail,
 		)
+		return &CompletionItem{
+			CompletionItem: lspItem,
+		}
 	})
 	itemDefaults := l.setItemDefaults(
 		ctx,
@@ -236,7 +253,7 @@ func (l *LanguageService) convertPathCompletions(
 		&defaultCommitCharacters,
 		nil, /*optionalReplacementSpan*/
 	)
-	return &lsproto.CompletionList{
+	return &CompletionList{
 		IsIncomplete: false,
 		ItemDefaults: itemDefaults,
 		Items:        items,
@@ -492,7 +509,8 @@ func fromUnionableLiteralType(
 			walkUpParentheses(grandparent.Parent),
 			parent,
 			position,
-			typeChecker)
+			typeChecker,
+		)
 		if result == nil {
 			return nil
 		}
@@ -548,7 +566,8 @@ func stringLiteralCompletionsForObjectLiteral(
 		contextualType,
 		completionsType,
 		objectLiteralExpression,
-		typeChecker)
+		typeChecker,
+	)
 
 	return &completionsFromProperties{
 		symbols:           symbols,
@@ -571,28 +590,44 @@ func (l *LanguageService) getStringLiteralCompletionsFromModuleNames(
 	program *compiler.Program,
 	checker *checker.Checker,
 ) *stringLiteralCompletions {
+	textStart := astnav.GetStartOfNode(node, file, false /*includeJSDoc*/) + 1
+	replacementSpan, ok := l.pathCompletionReplacementSpan(file, getDirectoryFragmentRange(node.Text(), textStart))
+	if !ok {
+		return nil
+	}
 	nameAndKinds := l.getStringLiteralCompletionsFromModuleNamesWorker(
 		file,
 		node,
 		program,
 		checker,
 	)
-	textStart := astnav.GetStartOfNode(node, file, false /*includeJSDoc*/) + 1
 	return &stringLiteralCompletions{
-		fromPaths: addReplacementSpans(node.Text(), textStart, nameAndKinds),
+		fromPaths: &pathCompletions{
+			entries:         toPathCompletions(nameAndKinds),
+			replacementSpan: replacementSpan,
+		},
 	}
 }
 
-func addReplacementSpans(text string, textStart int, names []moduleCompletionNameAndKind) []*pathCompletion {
-	textRange := getDirectoryFragmentRange(text, textStart)
+func toPathCompletions(names []moduleCompletionNameAndKind) []*pathCompletion {
 	return core.Map(names, func(nameAndKind moduleCompletionNameAndKind) *pathCompletion {
 		return &pathCompletion{
 			name:      nameAndKind.name,
 			kind:      moduletToScriptElementKind(nameAndKind.kind),
 			extension: nameAndKind.extension,
-			textRange: textRange,
 		}
 	})
+}
+
+func (l *LanguageService) pathCompletionReplacementSpan(file *ast.SourceFile, textRange *core.TextRange) (*lsproto.Range, bool) {
+	if textRange == nil {
+		return nil, true
+	}
+	lspRange, fidelity := l.createLspRangeFromBounds(textRange.Pos(), textRange.End(), file)
+	if !fidelity.IsExact() {
+		return nil, false
+	}
+	return &lspRange, true
 }
 
 func moduletToScriptElementKind(kind moduleCompletionKind) lsutil.ScriptElementKind {
@@ -955,16 +990,14 @@ func (l *LanguageService) getCompletionEntriesFromTypingsDirectories(
 }
 
 func tryRemoveDirectoryPrefix(path string, prefix string, useCaseSensitiveFileNames bool) *string {
-	canonicalPath := tspath.GetCanonicalFileName(path, useCaseSensitiveFileNames)
-	canonicalPrefix := tspath.GetCanonicalFileName(prefix, useCaseSensitiveFileNames)
-	if strings.HasPrefix(canonicalPath, canonicalPrefix) {
-		withoutPrefix := path[len(prefix):]
-		if strings.HasPrefix(withoutPrefix, "/") || strings.HasPrefix(withoutPrefix, "\\") {
-			withoutPrefix = withoutPrefix[1:]
-		}
-		return &withoutPrefix
+	withoutPrefix, ok := tspath.TrimFilePathPrefix(path, prefix, useCaseSensitiveFileNames)
+	if !ok {
+		return nil
 	}
-	return nil
+	if strings.HasPrefix(withoutPrefix, "/") || strings.HasPrefix(withoutPrefix, "\\") {
+		withoutPrefix = withoutPrefix[1:]
+	}
+	return &withoutPrefix
 }
 
 func (l *LanguageService) enumerateNodeModulesVisibleToScript(scriptPath string) []string {
@@ -995,7 +1028,7 @@ func (l *LanguageService) getExtensionOptions(
 	mode core.ResolutionMode,
 	checker *checker.Checker,
 ) *extensionOptions {
-	extensionsToSearch := getSupportedExtensionsForModuleResolution(options, checker)
+	extensionsToSearch := getSupportedExtensionsForModuleResolution(options, l.GetProgram().CommandLine().ContentMapperExtensions(), checker)
 
 	return &extensionOptions{
 		extensionsToSearch:  extensionsToSearch,
@@ -1006,7 +1039,7 @@ func (l *LanguageService) getExtensionOptions(
 	}
 }
 
-func getSupportedExtensionsForModuleResolution(options *core.CompilerOptions, checker *checker.Checker) []string {
+func getSupportedExtensionsForModuleResolution(options *core.CompilerOptions, extraExtensions []string, checker *checker.Checker) []string {
 	/** file extensions from ambient modules declarations e.g. *.css */
 	var extensions []string
 	if checker != nil {
@@ -1019,7 +1052,7 @@ func getSupportedExtensionsForModuleResolution(options *core.CompilerOptions, ch
 			extensions = append(extensions, name[1:])
 		}
 	}
-	supportedExtensions := tsoptions.GetSupportedExtensions(options, nil /*extraFileExtensions*/)
+	supportedExtensions := tsoptions.GetSupportedExtensions(options, extraExtensions)
 	for _, ext := range supportedExtensions {
 		extensions = append(extensions, ext...)
 	}
@@ -1466,10 +1499,18 @@ func (l *LanguageService) getCompletionsForPathMapping(
 	extensionOptions *extensionOptions,
 	program *compiler.Program,
 ) []moduleCompletionNameAndKind {
+	fragmentDirectory := getFragmentDirectory(fragment)
+	if fragmentDirectory != "" {
+		fragmentDirectory = tspath.EnsureTrailingDirectorySeparator(fragmentDirectory)
+	}
 	justPathMappingName := func(name string, kind moduleCompletionKind, extension string) []moduleCompletionNameAndKind {
 		if strings.HasPrefix(name, fragment) {
+			name = tspath.RemoveTrailingDirectorySeparator(name)
+			if fragmentDirectory != "" {
+				name = strings.TrimPrefix(name, fragmentDirectory)
+			}
 			return []moduleCompletionNameAndKind{{
-				name:      tspath.RemoveTrailingDirectorySeparator(name),
+				name:      name,
 				kind:      kind,
 				extension: extension,
 			}}
@@ -1491,10 +1532,6 @@ func (l *LanguageService) getCompletionsForPathMapping(
 
 	pathPrefix := parsedPath.Text[:parsedPath.StarIndex]
 	pathSuffix := parsedPath.Text[parsedPath.StarIndex+1:]
-	fragmentDirectory := getFragmentDirectory(fragment)
-	if fragmentDirectory != "" {
-		fragmentDirectory = tspath.EnsureTrailingDirectorySeparator(fragmentDirectory)
-	}
 	if !strings.HasPrefix(fragment, pathPrefix) {
 		// Fragment doesn't match the path mapping prefix at all:
 		// we cannot extend it via this path.
@@ -2145,7 +2182,7 @@ func (l *LanguageService) getTripleSlashReferenceCompletions(
 	position int,
 	program *compiler.Program,
 	checker *checker.Checker,
-) []*pathCompletion {
+) *pathCompletions {
 	compilerOptions := program.Options()
 	token := astnav.GetTokenAtPosition(file, position)
 	commentRanges := slices.Collect(scanner.GetLeadingCommentRanges(&ast.NodeFactory{}, file.Text(), token.Pos()))
@@ -2164,6 +2201,10 @@ func (l *LanguageService) getTripleSlashReferenceCompletions(
 
 	text := file.Text()[foundRange.Pos():position]
 	prefix, kind, toComplete, ok := parseTripleSlashDirectiveFragment(text)
+	if !ok {
+		return nil
+	}
+	replacementSpan, ok := l.pathCompletionReplacementSpan(file, getDirectoryFragmentRange(toComplete, foundRange.Pos()+len(prefix)))
 	if !ok {
 		return nil
 	}
@@ -2191,5 +2232,8 @@ func (l *LanguageService) getTripleSlashReferenceCompletions(
 		names = slices.Collect(maps.Values(result.names))
 	}
 
-	return addReplacementSpans(toComplete, foundRange.Pos()+len(prefix), names)
+	return &pathCompletions{
+		entries:         toPathCompletions(names),
+		replacementSpan: replacementSpan,
+	}
 }

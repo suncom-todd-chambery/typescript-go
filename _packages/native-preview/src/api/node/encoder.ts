@@ -1,6 +1,5 @@
 import type {
     FileReference,
-    JSDocParameterOrPropertyTag,
     LiteralLikeNode,
     Node,
     NodeArray,
@@ -88,15 +87,6 @@ function cachedEncoder(): TextEncoder {
 function getChildrenPropertyMask(node: Node): number {
     const kind = node.kind;
 
-    // Special handling for JSDocParameterTag and JSDocPropertyTag
-    if (kind === SyntaxKind.JSDocParameterTag || kind === SyntaxKind.JSDocPropertyTag) {
-        const tag = node as JSDocParameterOrPropertyTag;
-        if (tag.isNameFirst) {
-            return (boolBit(tag.tagName) << 0) | (boolBit(tag.name) << 1) | (boolBit(tag.typeExpression) << 2) | (boolBit(tag.comment) << 3);
-        }
-        return (boolBit(tag.tagName) << 0) | (boolBit(tag.typeExpression) << 1) | (boolBit(tag.name) << 2) | (boolBit(tag.comment) << 3);
-    }
-
     const props = childProperties[kind];
     if (!props) {
         return 0;
@@ -110,10 +100,6 @@ function getChildrenPropertyMask(node: Node): number {
         }
     }
     return mask;
-}
-
-function boolBit(v: unknown): number {
-    return isChildPresent(v) ? 1 : 0;
 }
 
 // A child is "present" if it's non-null/non-undefined.
@@ -153,7 +139,8 @@ function recordExtendedData(node: Node, strs: StringTable, extendedData: number[
         const referencedFilesOffset = encodeFileReferences(sf.referencedFiles, structuredWriter);
         const typeRefDirectivesOffset = encodeFileReferences(sf.typeReferenceDirectives, structuredWriter);
         const libRefDirectivesOffset = encodeFileReferences(sf.libReferenceDirectives, structuredWriter);
-        extendedData.push(textIndex, fileNameIndex, pathIndex, sf.languageVariant, sf.scriptKind, referencedFilesOffset, typeRefDirectivesOffset, libRefDirectivesOffset, NO_STRUCTURED_DATA, NO_STRUCTURED_DATA, NO_STRUCTURED_DATA, 0);
+        // Content-mapper metadata is program-owned and supplied only by the Go encoder.
+        extendedData.push(textIndex, fileNameIndex, pathIndex, sf.languageVariant, sf.scriptKind, referencedFilesOffset, typeRefDirectivesOffset, libRefDirectivesOffset, NO_STRUCTURED_DATA, NO_STRUCTURED_DATA, NO_STRUCTURED_DATA, 0, textIndex, NO_STRUCTURED_DATA, NO_STRUCTURED_DATA, NO_STRUCTURED_DATA, NO_STRUCTURED_DATA, NO_STRUCTURED_DATA, NO_STRUCTURED_DATA);
     }
     else if (
         node.kind === SyntaxKind.TemplateHead ||
@@ -196,13 +183,7 @@ function getNodeData(node: Node, strs: StringTable, extendedData: number[], stru
 }
 
 function getChildPropertiesForNode(node: Node): readonly (string | undefined)[] | undefined {
-    const kind = node.kind;
-    if (kind === SyntaxKind.JSDocParameterTag || kind === SyntaxKind.JSDocPropertyTag) {
-        return (node as JSDocParameterOrPropertyTag).isNameFirst
-            ? ["tagName", "name", "typeExpression", "comment"]
-            : ["tagName", "typeExpression", "name", "comment"];
-    }
-    return childProperties[kind];
+    return childProperties[node.kind];
 }
 
 // Returns whether a value is a NodeArray (array-like with pos and end).

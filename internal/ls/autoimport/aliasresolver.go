@@ -154,6 +154,11 @@ func (r *aliasResolver) CommonSourceDirectory() string {
 	panic("unimplemented")
 }
 
+// ContentMapperExtensions implements checker.Program.
+func (r *aliasResolver) ContentMapperExtensions() []string {
+	return nil
+}
+
 // FileExists implements checker.Program.
 func (r *aliasResolver) FileExists(fileName string) bool {
 	panic("unimplemented")
@@ -216,7 +221,7 @@ func (r *aliasResolver) GetSourceOfProjectReferenceIfOutputIncluded(file ast.Has
 
 // IsSourceFileDefaultLibrary implements checker.Program.
 func (r *aliasResolver) IsSourceFileDefaultLibrary(path tspath.Path) bool {
-	panic("unimplemented")
+	return false
 }
 
 // IsSourceFromProjectReference implements checker.Program.

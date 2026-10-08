@@ -5,21 +5,31 @@ import (
 
 	"github.com/microsoft/typescript-go/internal/ast"
 	"github.com/microsoft/typescript-go/internal/astnav"
+	"github.com/microsoft/typescript-go/internal/ls/lsconv"
 	"github.com/microsoft/typescript-go/internal/lsp/lsproto"
 	"github.com/microsoft/typescript-go/internal/scanner"
+	"github.com/microsoft/typescript-go/internal/spanmap"
 )
 
-func (l *LanguageService) ProvideOnAutoInsert(ctx context.Context, params *lsproto.VsOnAutoInsertParams) (lsproto.VsOnAutoInsertResponse, error) {
+func (l *LanguageService) ProvideOnAutoInsert(ctx context.Context, params *lsproto.VSOnAutoInsertParams) (lsproto.VSOnAutoInsertResponse, error) {
+	if l.UserPreferences().EnableAutoClosingTags.IsFalse() {
+		return lsproto.VSOnAutoInsertResponse{}, nil
+	}
 	if params.VSCh != ">" {
-		return lsproto.VsOnAutoInsertResponse{}, nil
+		return lsproto.VSOnAutoInsertResponse{}, nil
 	}
 
 	_, sourceFile := l.getProgramAndFile(params.VSTextDocument.Uri)
-	position := l.converters.LineAndCharacterToPosition(sourceFile, params.VSPosition)
+	positions := lsconv.FromLSPPositionForSourceFile(l.converters, sourceFile, params.VSPosition, spanmap.FeatureAutoInsert)
+	if len(positions) != 1 || !positions[0].Fidelity.IsExact() {
+		return lsproto.VSOnAutoInsertResponse{}, nil
+	}
+	sourceFile = positions[0].Script
+	position := positions[0].Position
 
 	token := astnav.FindPrecedingToken(sourceFile, int(position))
 	if token == nil {
-		return lsproto.VsOnAutoInsertResponse{}, nil
+		return lsproto.VSOnAutoInsertResponse{}, nil
 	}
 
 	var closingText string
@@ -48,11 +58,11 @@ func (l *LanguageService) ProvideOnAutoInsert(ctx context.Context, params *lspro
 	}
 
 	if closingText == "" {
-		return lsproto.VsOnAutoInsertResponse{}, nil
+		return lsproto.VSOnAutoInsertResponse{}, nil
 	}
 
-	return lsproto.VsOnAutoInsertResponse{
-		VsOnAutoInsertResponseItem: &lsproto.VsOnAutoInsertResponseItem{
+	return lsproto.VSOnAutoInsertResponse{
+		VSOnAutoInsertResponseItem: &lsproto.VSOnAutoInsertResponseItem{
 			VSTextEditFormat: lsproto.InsertTextFormatSnippet,
 			VSTextEdit: &lsproto.TextEdit{
 				Range: lsproto.Range{Start: params.VSPosition, End: params.VSPosition},

@@ -1,6 +1,7 @@
 package tsctests
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"slices"
@@ -40,9 +41,9 @@ type tscInput struct {
 	windowsStyleRoot string
 }
 
-func (test *tscInput) executeCommand(sys *TestSys, baselineBuilder *strings.Builder, commandLineArgs []string) tsc.CommandLineResult {
+func (test *tscInput) executeCommand(ctx context.Context, sys *TestSys, baselineBuilder *strings.Builder, commandLineArgs []string) tsc.CommandLineResult {
 	fmt.Fprint(baselineBuilder, "tsgo ", strings.Join(commandLineArgs, " "), "\n")
-	result := execute.CommandLine(sys, commandLineArgs, sys)
+	result := execute.CommandLine(ctx, sys, commandLineArgs, sys)
 	switch result.Status {
 	case tsc.ExitStatusSuccess:
 		baselineBuilder.WriteString("ExitStatus:: Success")
@@ -66,6 +67,8 @@ func (test *tscInput) run(t *testing.T, scenario string) {
 	t.Helper()
 	t.Run(test.getBaselineSubFolder()+"/"+test.subScenario, func(t *testing.T) {
 		t.Parallel()
+		// ctx is cancelled when the subtest ends, tearing down any content mapper host created during the run.
+		ctx := t.Context()
 		// initial test tsc compile
 		baselineBuilder := &strings.Builder{}
 		sys := newTestSys(test, false)
@@ -78,8 +81,11 @@ func (test *tscInput) run(t *testing.T, scenario string) {
 			"\nInput::\n",
 		)
 		sys.baselineFSwithDiff(baselineBuilder)
-		result := test.executeCommand(sys, baselineBuilder, test.commandLineArgs)
+		result := test.executeCommand(ctx, sys, baselineBuilder, test.commandLineArgs)
 		sys.serializeState(baselineBuilder)
+		if result.Watcher != nil && sys.mockWatchBackend.HasWatches() {
+			baselineBuilder.WriteString(sys.mockWatchBackend.WatchState())
+		}
 		var unexpectedDiff strings.Builder
 		unexpectedDiff.WriteString(sys.baselinePrograms(baselineBuilder, "Initial build"))
 
@@ -93,14 +99,19 @@ func (test *tscInput) run(t *testing.T, scenario string) {
 				if do.edit != nil {
 					do.edit(sys)
 				}
+				changedPaths := sys.fsDiffer.ChangedPaths()
 				sys.baselineFSwithDiff(baselineBuilder)
 
 				if result.Watcher == nil {
-					test.executeCommand(sys, baselineBuilder, commandLineArgs)
+					test.executeCommand(ctx, sys, baselineBuilder, commandLineArgs)
 				} else {
+					sys.mockWatchBackend.SendChangedPaths(changedPaths)
 					result.Watcher.DoCycle()
 				}
 				sys.serializeState(baselineBuilder)
+				if result.Watcher != nil && sys.mockWatchBackend.HasWatches() {
+					baselineBuilder.WriteString(sys.mockWatchBackend.WatchState())
+				}
 				unexpectedDiff.WriteString(sys.baselinePrograms(baselineBuilder, fmt.Sprintf("Edit [%d]:: %s\n", index, do.caption)))
 			})
 			wg.Queue(func() {
@@ -111,7 +122,7 @@ func (test *tscInput) run(t *testing.T, scenario string) {
 						test.edits[i].edit(nonIncrementalSys)
 					}
 				}
-				execute.CommandLine(nonIncrementalSys, commandLineArgs, nonIncrementalSys)
+				execute.CommandLine(ctx, nonIncrementalSys, commandLineArgs, nonIncrementalSys)
 			})
 			wg.RunAndWait()
 

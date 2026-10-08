@@ -6,8 +6,10 @@ import (
 
 	"github.com/microsoft/typescript-go/internal/ast"
 	"github.com/microsoft/typescript-go/internal/collections"
+	"github.com/microsoft/typescript-go/internal/contentmapper"
 	"github.com/microsoft/typescript-go/internal/core"
 	"github.com/microsoft/typescript-go/internal/diagnostics"
+	"github.com/microsoft/typescript-go/internal/json"
 	"github.com/microsoft/typescript-go/internal/tspath"
 )
 
@@ -63,22 +65,97 @@ func parseNumber(value any) *int {
 	if num, ok := value.(int); ok {
 		return &num
 	}
+	if num, ok := value.(float64); ok {
+		n := int(num)
+		return &n
+	}
 	return nil
 }
 
-func parseProjectReference(json any) []*core.ProjectReference {
-	var result []*core.ProjectReference
+type projectReferenceParseResult struct {
+	reference     core.ProjectReference
+	hasPath       bool
+	pathValid     bool
+	hasCircular   bool
+	circularValid bool
+}
+
+func parseProjectReference(json any) *projectReferenceParseResult {
 	if v, ok := json.(*collections.OrderedMap[string, any]); ok {
-		var reference core.ProjectReference
-		if v, ok := v.Get("path"); ok {
-			reference.Path = v.(string)
+		result := &projectReferenceParseResult{}
+		if value, ok := v.Get("path"); ok {
+			result.hasPath = true
+			if path, ok := value.(string); ok {
+				result.reference.Path = path
+				result.pathValid = true
+			}
 		}
-		if v, ok := v.Get("circular"); ok {
-			reference.Circular = v.(bool)
+		if value, ok := v.Get("circular"); ok {
+			result.hasCircular = true
+			if circular, ok := value.(bool); ok {
+				result.reference.Circular = circular
+				result.circularValid = true
+			}
 		}
-		result = append(result, &reference)
+		return result
 	}
-	return result
+	return nil
+}
+
+func parseContentMapper(value any) (*contentmapper.Mapper, []*ast.Diagnostic) {
+	v, ok := value.(*collections.OrderedMap[string, any])
+	if !ok {
+		return nil, nil
+	}
+	var errors []*ast.Diagnostic
+	mapper := &contentmapper.Mapper{}
+	if pkg, ok := v.Get("package"); ok {
+		if str, isString := pkg.(string); isString && str != "" {
+			mapper.Package = str
+		} else {
+			errors = append(errors, ast.NewCompilerDiagnostic(diagnostics.Compiler_option_0_requires_a_value_of_type_1, "contentMapper.package", "string"))
+		}
+	} else {
+		errors = append(errors, ast.NewCompilerDiagnostic(diagnostics.Compiler_option_0_requires_a_value_of_type_1, "contentMapper.package", "string"))
+	}
+	if extensions, ok := v.Get("extensions"); ok {
+		if strs, isStringArray := parseStringArrayStrict(extensions); isStringArray {
+			mapper.Definition.Extensions = strs
+		} else {
+			errors = append(errors, ast.NewCompilerDiagnostic(diagnostics.Compiler_option_0_requires_a_value_of_type_1, "contentMapper.extensions", "string[]"))
+		}
+	} else {
+		errors = append(errors, ast.NewCompilerDiagnostic(diagnostics.Compiler_option_0_requires_a_value_of_type_1, "contentMapper.extensions", "string[]"))
+	}
+	if options, ok := v.Get("options"); ok {
+		if _, isObject := options.(*collections.OrderedMap[string, any]); !isObject {
+			errors = append(errors, ast.NewCompilerDiagnostic(diagnostics.Compiler_option_0_requires_a_value_of_type_1, "contentMapper.options", "object"))
+		} else {
+			mapper.Options, _ = json.Marshal(options)
+		}
+	}
+	if len(errors) != 0 {
+		return nil, errors
+	}
+	return mapper, errors
+}
+
+// parseStringArrayStrict returns the string slice and true only if value is an array whose
+// elements are all strings. A missing element or wrong element type yields false.
+func parseStringArrayStrict(value any) ([]string, bool) {
+	arr, ok := value.([]any)
+	if !ok {
+		return nil, false
+	}
+	result := make([]string, 0, len(arr))
+	for _, v := range arr {
+		str, ok := v.(string)
+		if !ok {
+			return nil, false
+		}
+		result = append(result, str)
+	}
+	return result, true
 }
 
 func parseJsonToStringKey(json any) *collections.OrderedMap[string, any] {
@@ -95,6 +172,9 @@ func parseJsonToStringKey(json any) *collections.OrderedMap[string, any] {
 		}
 		if v, ok := m.Get("references"); ok {
 			result.Set("references", v)
+		}
+		if v, ok := m.Get("contentMappers"); ok {
+			result.Set("contentMappers", v)
 		}
 		if v, ok := m.Get("extends"); ok {
 			if str, ok := v.(string); ok {
@@ -118,6 +198,7 @@ func parseJsonToStringKey(json any) *collections.OrderedMap[string, any] {
 type optionParser interface {
 	ParseOption(key string, value any) []*ast.Diagnostic
 	UnknownOptionDiagnostic() *diagnostics.Message
+	UnknownDidYouMeanDiagnostic() *diagnostics.Message
 }
 
 type compilerOptionsParser struct {
@@ -132,6 +213,10 @@ func (o *compilerOptionsParser) UnknownOptionDiagnostic() *diagnostics.Message {
 	return extraKeyDiagnostics("compilerOptions")
 }
 
+func (o *compilerOptionsParser) UnknownDidYouMeanDiagnostic() *diagnostics.Message {
+	return extraKeyDidYouMeanDiagnostics("compilerOptions")
+}
+
 type watchOptionsParser struct {
 	*core.WatchOptions
 }
@@ -142,6 +227,10 @@ func (o *watchOptionsParser) ParseOption(key string, value any) []*ast.Diagnosti
 
 func (o *watchOptionsParser) UnknownOptionDiagnostic() *diagnostics.Message {
 	return extraKeyDiagnostics("watchOptions")
+}
+
+func (o *watchOptionsParser) UnknownDidYouMeanDiagnostic() *diagnostics.Message {
+	return extraKeyDidYouMeanDiagnostics("watchOptions")
 }
 
 type typeAcquisitionParser struct {
@@ -156,6 +245,10 @@ func (o *typeAcquisitionParser) UnknownOptionDiagnostic() *diagnostics.Message {
 	return extraKeyDiagnostics("typeAcquisition")
 }
 
+func (o *typeAcquisitionParser) UnknownDidYouMeanDiagnostic() *diagnostics.Message {
+	return extraKeyDidYouMeanDiagnostics("typeAcquisition")
+}
+
 type buildOptionsParser struct {
 	*core.BuildOptions
 }
@@ -166,6 +259,10 @@ func (o *buildOptionsParser) ParseOption(key string, value any) []*ast.Diagnosti
 
 func (o *buildOptionsParser) UnknownOptionDiagnostic() *diagnostics.Message {
 	return extraKeyDiagnostics("buildOptions")
+}
+
+func (o *buildOptionsParser) UnknownDidYouMeanDiagnostic() *diagnostics.Message {
+	return extraKeyDidYouMeanDiagnostics("buildOptions")
 }
 
 func ParseCompilerOptions(key string, value any, allOptions *core.CompilerOptions) []*ast.Diagnostic {
@@ -451,6 +548,8 @@ func parseCompilerOptions(key string, value any, allOptions *core.CompilerOption
 		allOptions.Quiet = ParseTristate(value)
 	case "checkers":
 		allOptions.Checkers = parseNumber(value)
+	case "runExternalCode":
+		allOptions.RunExternalCode = ParseTristate(value)
 	default:
 		// different than any key above
 		return false
@@ -619,6 +718,14 @@ func ConvertOptionToAbsolutePath(o string, v any, optionMap CommandLineOptionNam
 			if arr, ok := v.([]string); ok {
 				return core.Map(arr, func(item string) string {
 					return tspath.GetNormalizedAbsolutePath(item, cwd)
+				}), true
+			}
+			if arr, ok := v.([]any); ok {
+				return core.Map(arr, func(item any) any {
+					if s, isStr := item.(string); isStr {
+						return tspath.GetNormalizedAbsolutePath(s, cwd)
+					}
+					return item
 				}), true
 			}
 		}

@@ -1,6 +1,7 @@
 package compiler_test
 
 import (
+	"fmt"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -245,12 +246,12 @@ func TestProgram(t *testing.T) {
 
 			program := compiler.NewProgram(compiler.ProgramOptions{
 				Config: &tsoptions.ParsedCommandLine{
-					ParsedConfig: &core.ParsedOptions{
+					ParsedConfig: &tsoptions.ParsedOptions{
 						FileNames:       []string{"c:/dev/src/index.ts"},
 						CompilerOptions: &opts,
 					},
 				},
-				Host: compiler.NewCompilerHost("c:/dev/src", fs, bundled.LibPath(), nil, nil),
+				Host: compiler.NewCompilerHost("c:/dev/src", fs, bundled.LibPath(), nil, nil, nil),
 			})
 
 			actualFiles := []string{}
@@ -261,6 +262,51 @@ func TestProgram(t *testing.T) {
 			assert.DeepEqual(t, testCase.expectedFiles, actualFiles)
 		})
 	}
+}
+
+func TestIncludeProcessorDiagnosticsWithMissingFileCasing(t *testing.T) {
+	t.Parallel()
+
+	if !bundled.Embedded {
+		t.Skip("bundled files are not embedded")
+	}
+
+	// Use case-sensitive file names so that /src/MyFile.ts and /src/myFile.ts
+	// have different canonical paths but the same lower-case path, triggering
+	// file casing diagnostics in the include processor.
+	fs := vfstest.FromMap[any](nil, true /*useCaseSensitiveFileNames*/)
+	fs = bundled.WrapFS(fs)
+
+	// Only create the lowercase version; /src/MyFile.ts does not exist.
+	_ = fs.WriteFile("/src/myFile.ts", `export const y = 2;`)
+
+	opts := core.CompilerOptions{SkipDefaultLibCheck: core.TSTrue}
+
+	// List both casings as root files. The first one (/src/MyFile.ts) will fail
+	// to load because it does not exist on the case-sensitive filesystem.
+	program := compiler.NewProgram(compiler.ProgramOptions{
+		Config: &tsoptions.ParsedCommandLine{
+			ParsedConfig: &tsoptions.ParsedOptions{
+				FileNames:       []string{"/src/MyFile.ts", "/src/myFile.ts"},
+				CompilerOptions: &opts,
+			},
+		},
+		Host: compiler.NewCompilerHost("/", fs, bundled.LibPath(), nil, nil, nil),
+	})
+
+	// GetProgramDiagnostics triggers getDiagnostics which processes all
+	// include processor diagnostics including the casing diagnostic whose
+	// file path points to the missing /src/MyFile.ts. Before the fix this
+	// panicked with a nil pointer dereference.
+	assert.NilError(t, func() (err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				err = fmt.Errorf("panic: %v", r)
+			}
+		}()
+		program.GetProgramDiagnostics()
+		return nil
+	}())
 }
 
 func BenchmarkNewProgram(b *testing.B) {
@@ -282,12 +328,12 @@ func BenchmarkNewProgram(b *testing.B) {
 			opts := core.CompilerOptions{Target: testCase.target}
 			programOpts := compiler.ProgramOptions{
 				Config: &tsoptions.ParsedCommandLine{
-					ParsedConfig: &core.ParsedOptions{
+					ParsedConfig: &tsoptions.ParsedOptions{
 						FileNames:       []string{"c:/dev/src/index.ts"},
 						CompilerOptions: &opts,
 					},
 				},
-				Host: compiler.NewCompilerHost("c:/dev/src", fs, bundled.LibPath(), nil, nil),
+				Host: compiler.NewCompilerHost("c:/dev/src", fs, bundled.LibPath(), nil, nil, nil),
 			}
 
 			for b.Loop() {
@@ -304,7 +350,7 @@ func BenchmarkNewProgram(b *testing.B) {
 		fs := osvfs.FS()
 		fs = bundled.WrapFS(fs)
 
-		host := compiler.NewCompilerHost(rootPath, fs, bundled.LibPath(), nil, nil)
+		host := compiler.NewCompilerHost(rootPath, fs, bundled.LibPath(), nil, nil, nil)
 
 		parsed, errors := tsoptions.GetParsedCommandLineOfConfigFile(tspath.CombinePaths(rootPath, "tsconfig.json"), nil, nil, host, nil)
 		assert.Equal(b, len(errors), 0, "Expected no errors in parsed command line")

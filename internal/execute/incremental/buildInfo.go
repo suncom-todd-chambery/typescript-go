@@ -3,9 +3,11 @@ package incremental
 import (
 	"fmt"
 	"iter"
+	"slices"
 
 	"github.com/microsoft/typescript-go/internal/ast"
 	"github.com/microsoft/typescript-go/internal/collections"
+	"github.com/microsoft/typescript-go/internal/contentmapper"
 	"github.com/microsoft/typescript-go/internal/core"
 	"github.com/microsoft/typescript-go/internal/diagnostics"
 	"github.com/microsoft/typescript-go/internal/json"
@@ -201,6 +203,8 @@ type BuildInfoDiagnostic struct {
 	End                int                      `json:"end,omitzero"`
 	Code               int32                    `json:"code,omitzero"`
 	Category           diagnostics.Category     `json:"category,omitzero"`
+	Source             string                   `json:"source,omitzero"`
+	MessageText        string                   `json:"messageText,omitzero"`
 	MessageKey         diagnostics.Key          `json:"messageKey,omitzero"`
 	MessageArgs        []string                 `json:"messageArgs,omitzero"`
 	MessageChain       []*BuildInfoDiagnostic   `json:"messageChain,omitzero"`
@@ -463,9 +467,12 @@ type BuildInfo struct {
 	Version string `json:"version,omitzero"`
 
 	// Common between incremental and tsc -b buildinfo for non incremental programs
-	Errors       bool             `json:"errors,omitzero"`
-	CheckPending bool             `json:"checkPending,omitzero"`
-	Root         []*BuildInfoRoot `json:"root,omitzero"`
+	Errors                  bool             `json:"errors,omitzero"`
+	CheckPending            bool             `json:"checkPending,omitzero"`
+	Root                    []*BuildInfoRoot `json:"root,omitzero"`
+	PackageJsons            []string         `json:"packageJsons,omitzero"`
+	MissingPackageJsons     []string         `json:"missingPackageJsons,omitzero"`
+	ContentMapperIdentities []string         `json:"contentMapperIdentities,omitzero"`
 
 	// IncrementalProgram info
 	FileNames                  []string                             `json:"fileNames,omitzero"`
@@ -489,15 +496,40 @@ func (b *BuildInfo) IsValidVersion() bool {
 	return b.Version == core.Version()
 }
 
+// ContentMapperIdentities returns the project's sorted mapper transform identities. A nil project means
+// the compiler host has no configured content mappers.
+func ContentMapperIdentities(project contentmapper.Project) ([]string, error) {
+	if project == nil {
+		return nil, nil
+	}
+	return project.Identities()
+}
+
+// ContentMapperIdentitiesMatch reports whether the content mapper identities recorded in this build info
+// match the given current identities (as produced by ContentMapperIdentities).
+func (b *BuildInfo) ContentMapperIdentitiesMatch(current []string) bool {
+	return slices.Equal(b.ContentMapperIdentities, current)
+}
+
 func (b *BuildInfo) IsIncremental() bool {
 	return b != nil && len(b.FileNames) != 0
 }
 
+func IsBuildInfoFileNameDefaultLibrary(fileName string) bool {
+	return !tspath.PathIsRelative(fileName) && !tspath.PathIsAbsolute(fileName)
+}
+
 func (b *BuildInfo) fileName(fileId BuildInfoFileId) string {
+	if fileId < 1 || int(fileId) > len(b.FileNames) {
+		return ""
+	}
 	return b.FileNames[fileId-1]
 }
 
 func (b *BuildInfo) fileInfo(fileId BuildInfoFileId) *BuildInfoFileInfo {
+	if fileId < 1 || int(fileId) > len(b.FileInfos) {
+		return nil
+	}
 	return b.FileInfos[fileId-1]
 }
 
@@ -529,6 +561,24 @@ func (b *BuildInfo) IsEmitPending(resolved *tsoptions.ParsedCommandLine, buildIn
 	return false
 }
 
+func (b *BuildInfo) GetPackageJsons(buildInfoDirectory string) iter.Seq[string] {
+	return getNormalizedPaths(b.PackageJsons, buildInfoDirectory)
+}
+
+func (b *BuildInfo) GetMissingPackageJsons(buildInfoDirectory string) iter.Seq[string] {
+	return getNormalizedPaths(b.MissingPackageJsons, buildInfoDirectory)
+}
+
+func getNormalizedPaths(paths []string, buildInfoDirectory string) iter.Seq[string] {
+	return func(yield func(string) bool) {
+		for _, path := range paths {
+			if !yield(tspath.GetNormalizedAbsolutePath(path, buildInfoDirectory)) {
+				return
+			}
+		}
+	}
+}
+
 func (b *BuildInfo) GetBuildInfoRootInfoReader(buildInfoDirectory string, comparePathOptions tspath.ComparePathsOptions) *BuildInfoRootInfoReader {
 	resolvedRootFileInfos := make(map[tspath.Path]*BuildInfoFileInfo, len(b.FileNames))
 	// Roots of the File
@@ -540,10 +590,17 @@ func (b *BuildInfo) GetBuildInfoRootInfoReader(buildInfoDirectory string, compar
 
 	// Create map from resolvedRoot to Root
 	for _, resolved := range b.ResolvedRoot {
-		resolvedToRoot[toPath(b.fileName(resolved.Resolved))] = toPath(b.fileName(resolved.Root))
+		resolvedRoot := b.fileName(resolved.Resolved)
+		root := b.fileName(resolved.Root)
+		if resolvedRoot != "" && root != "" {
+			resolvedToRoot[toPath(resolvedRoot)] = toPath(root)
+		}
 	}
 
 	addRoot := func(resolvedRoot string, fileInfo *BuildInfoFileInfo) {
+		if resolvedRoot == "" {
+			return
+		}
 		resolvedRootPath := toPath(resolvedRoot)
 		if rootPath, ok := resolvedToRoot[resolvedRootPath]; ok {
 			rootToResolved.Set(rootPath, resolvedRootPath)

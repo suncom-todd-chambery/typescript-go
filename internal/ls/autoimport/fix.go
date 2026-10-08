@@ -50,6 +50,9 @@ type addToExistingImportFix struct {
 	namedImport   *newImportBinding
 }
 
+// Edits produces the text edits and a human-readable description for the fix. The returned bool is false
+// when the fix targets a content-mapped file and any edit could not be placed within a single verbatim
+// span, meaning it cannot be safely applied to the original text and the caller should discard it.
 func (f *Fix) Edits(
 	ctx context.Context,
 	file *ast.SourceFile,
@@ -57,20 +60,22 @@ func (f *Fix) Edits(
 	formatOptions lsutil.FormatCodeSettings,
 	converters *lsconv.Converters,
 	preferences lsutil.UserPreferences,
-) ([]*lsproto.TextEdit, string) {
+) ([]*lsproto.TextEdit, string, bool) {
 	locale := locale.FromContext(ctx)
 	tracker := change.NewTracker(ctx, compilerOptions, formatOptions, converters)
 	switch f.Kind {
 	case lsproto.AutoImportFixKindUseNamespace:
 		description := addNamespaceQualifier(f, tracker, file, locale)
-		return tracker.GetChanges()[file.FileName()], description
+		edits, safe := fileEdits(tracker, file)
+		return edits, description, safe
 	case lsproto.AutoImportFixKindAddToExisting:
 		if len(file.Imports()) <= int(f.ImportIndex) {
 			panic("import index out of range")
 		}
 		existingFix := getAddToExistingImportFix(file, f)
 		addToExistingImport(tracker, file, existingFix.importClauseOrBindingPattern, existingFix.defaultImport, core.SingleElementSlice(existingFix.namedImport), preferences)
-		return tracker.GetChanges()[file.FileName()], diagnostics.Update_import_from_0.Localize(locale, f.ModuleSpecifier)
+		edits, safe := fileEdits(tracker, file)
+		return edits, diagnostics.Update_import_from_0.Localize(locale, f.ModuleSpecifier), safe
 	case lsproto.AutoImportFixKindAddNew:
 		var declarations []*ast.Statement
 		defaultImport := core.IfElse(f.ImportKind == lsproto.ImportKindDefault, &newImportBinding{name: f.Name, addAsTypeOnly: f.AddAsTypeOnly}, nil)
@@ -101,21 +106,33 @@ func (f *Fix) Edits(
 		// if qualification != nil {
 		// 	addNamespaceQualifier(tracker, file, qualification)
 		// }
-		return tracker.GetChanges()[file.FileName()], diagnostics.Add_import_from_0.Localize(locale, f.ModuleSpecifier)
+		edits, safe := fileEdits(tracker, file)
+		return edits, diagnostics.Add_import_from_0.Localize(locale, f.ModuleSpecifier), safe
 	case lsproto.AutoImportFixKindPromoteTypeOnly:
 		promotedDeclaration := promoteFromTypeOnly(tracker, f.TypeOnlyAliasDeclaration, compilerOptions, file, preferences)
 		if promotedDeclaration.Kind == ast.KindImportSpecifier {
 			moduleSpec := getModuleSpecifierText(promotedDeclaration.Parent.Parent)
-			return tracker.GetChanges()[file.FileName()], diagnostics.Remove_type_from_import_of_0_from_1.Localize(locale, f.Name, moduleSpec)
+			edits, safe := fileEdits(tracker, file)
+			return edits, diagnostics.Remove_type_from_import_of_0_from_1.Localize(locale, f.Name, moduleSpec), safe
 		}
 		moduleSpec := getModuleSpecifierText(promotedDeclaration)
-		return tracker.GetChanges()[file.FileName()], diagnostics.Remove_type_from_import_declaration_from_0.Localize(locale, moduleSpec)
+		edits, safe := fileEdits(tracker, file)
+		return edits, diagnostics.Remove_type_from_import_declaration_from_0.Localize(locale, moduleSpec), safe
 	case lsproto.AutoImportFixKindJsdocTypeImport:
 		description := addImportType(f, file, preferences, tracker, locale)
-		return tracker.GetChanges()[file.FileName()], description
+		edits, safe := fileEdits(tracker, file)
+		return edits, description, safe
 	default:
 		panic("unimplemented fix edit")
 	}
+}
+
+// fileEdits returns the edits recorded for file, along with whether they are safe to apply. GetChanges
+// drops the edits of any content-mapped file that cannot be faithfully mapped back to the original text,
+// so an empty result with safe == false means the fix could not be represented and must be discarded.
+func fileEdits(tracker *change.Tracker, file *ast.SourceFile) (edits []*lsproto.TextEdit, safe bool) {
+	changes, unmappable := tracker.GetChanges()
+	return changes[file.OriginalFileName()], len(unmappable) == 0
 }
 
 func addImportType(f *Fix, file *ast.SourceFile, preferences lsutil.UserPreferences, tracker *change.Tracker, locale locale.Locale) string {
@@ -574,7 +591,7 @@ func (v *View) GetFixes(ctx context.Context, export *Export, forJSX bool, isVali
 		}
 	}
 
-	importKind := getImportKind(v.importingFile, export, v.program)
+	importKind := getImportKind(v.importingFile, export, v.program, false /*forceImportKeyword*/)
 	addAsTypeOnly := getAddAsTypeOnly(isValidTypeOnlyUseSite, export, v.program.Options())
 
 	name := export.Name()
@@ -621,7 +638,7 @@ func (v *View) tryUseExistingNamespaceImport(ctx context.Context, export *Export
 		return nil
 	}
 
-	if getImportKind(v.importingFile, export, v.program) != lsproto.ImportKindNamed {
+	if getImportKind(v.importingFile, export, v.program, false /*forceImportKeyword*/) != lsproto.ImportKindNamed {
 		return nil
 	}
 
@@ -688,7 +705,7 @@ func (v *View) tryAddToExistingImport(
 		return nil
 	}
 
-	importKind := getImportKind(v.importingFile, export, v.program)
+	importKind := getImportKind(v.importingFile, export, v.program, false /*forceImportKeyword*/)
 	if importKind == lsproto.ImportKindCommonJS || importKind == lsproto.ImportKindNamespace {
 		return nil
 	}
@@ -777,7 +794,11 @@ func (v *View) tryAddToExistingImport(
 	return best
 }
 
-func getImportKind(importingFile *ast.SourceFile, export *Export, program *compiler.Program) lsproto.ImportKind {
+func GetImportKindForImportStatement(importingFile *ast.SourceFile, export *Export, program *compiler.Program) lsproto.ImportKind {
+	return getImportKind(importingFile, export, program, true /*forceImportKeyword*/)
+}
+
+func getImportKind(importingFile *ast.SourceFile, export *Export, program *compiler.Program, forceImportKeyword bool) lsproto.ImportKind {
 	if program.Options().VerbatimModuleSyntax.IsTrue() && program.GetEmitModuleFormatOfFile(importingFile) == core.ModuleKindCommonJS {
 		return lsproto.ImportKindCommonJS
 	}
@@ -808,7 +829,7 @@ func getImportKind(importingFile *ast.SourceFile, export *Export, program *compi
 		//     a require or an es6 import. The latter, compiled to CJS, has interop built in that will
 		//     avoid accessing .default, but if we write a require directly and call it a default import,
 		//     we emit an unconditional .default access.
-		if importingFile.ExternalModuleIndicator != nil || !ast.IsSourceFileJS(importingFile) {
+		if importingFile.ExternalModuleIndicator != nil || forceImportKeyword || !ast.IsSourceFileJS(importingFile) {
 			return lsproto.ImportKindDefault
 		}
 		return lsproto.ImportKindCommonJS
@@ -838,11 +859,15 @@ func (v *View) getExistingImports(ctx context.Context) *collections.MultiMap[Mod
 			panic("error: did not expect node kind " + moduleSpecifier.Kind.String())
 		} else if ast.IsVariableDeclarationInitializedToRequire(node.Parent) {
 			if moduleSymbol := ch.ResolveExternalModuleName(moduleSpecifier); moduleSymbol != nil {
-				result.Add(core.FirstResult(getModuleIDAndFileNameOfModuleSymbol(moduleSymbol)), existingImport{node: node.Parent, moduleSpecifier: moduleSpecifier.Text(), index: i})
+				if moduleID, _, ok := tryGetModuleIDAndFileNameOfModuleSymbol(moduleSymbol); ok {
+					result.Add(moduleID, existingImport{node: node.Parent, moduleSpecifier: moduleSpecifier.Text(), index: i})
+				}
 			}
 		} else if node.Kind == ast.KindImportDeclaration || node.Kind == ast.KindImportEqualsDeclaration || node.Kind == ast.KindJSDocImportTag {
 			if moduleSymbol := ch.GetSymbolAtLocation(moduleSpecifier); moduleSymbol != nil {
-				result.Add(core.FirstResult(getModuleIDAndFileNameOfModuleSymbol(moduleSymbol)), existingImport{node: node, moduleSpecifier: moduleSpecifier.Text(), index: i})
+				if moduleID, _, ok := tryGetModuleIDAndFileNameOfModuleSymbol(moduleSymbol); ok {
+					result.Add(moduleID, existingImport{node: node, moduleSpecifier: moduleSpecifier.Text(), index: i})
+				}
 			}
 		}
 	}
@@ -859,6 +884,69 @@ func (v *View) shouldUseRequire() bool {
 	return shouldUseRequire
 }
 
+// fileSyntaxKind represents the detected module syntax of a source file.
+type fileSyntaxKind int
+
+const (
+	fileSyntaxKindAmbiguous fileSyntaxKind = iota
+	fileSyntaxKindESM
+	fileSyntaxKindCJS
+)
+
+// detectSyntax returns whether a source file has unambiguous ESM or CJS syntax.
+// When moduleDetection is "force", ExternalModuleIndicator may be set to the
+// source file node itself rather than a genuine syntax indicator, so we fall back
+// to inspecting the file's Imports() to find actual import/export declarations.
+func detectSyntax(file *ast.SourceFile, options *core.CompilerOptions) fileSyntaxKind {
+	hasESM, hasCJS := detectSyntaxIndicators(file, options)
+	switch {
+	case hasCJS && !hasESM:
+		return fileSyntaxKindCJS
+	case hasESM && !hasCJS:
+		return fileSyntaxKindESM
+	default:
+		return fileSyntaxKindAmbiguous
+	}
+}
+
+// detectSyntaxIndicators checks whether a source file contains genuine ESM
+// and/or CJS syntax. Under moduleDetection "force", the cached
+// ExternalModuleIndicator may be the source file itself rather than a real
+// statement, so we look at Imports() for actual import/export declarations.
+func detectSyntaxIndicators(file *ast.SourceFile, options *core.CompilerOptions) (hasESM bool, hasCJS bool) {
+	hasCJS = file.CommonJSModuleIndicator != nil
+	if options.GetEmitModuleDetectionKind() != core.ModuleDetectionKindForce {
+		// ExternalModuleIndicator is reliable when moduleDetection is not "force"
+		hasESM = file.ExternalModuleIndicator != nil
+		return hasESM, hasCJS
+	}
+	// Under moduleDetection "force", ExternalModuleIndicator is set to
+	// file.AsNode() when there is no genuine ESM syntax, so only trust it
+	// when it points to a real statement node.
+	if file.ExternalModuleIndicator != nil && file.ExternalModuleIndicator != file.AsNode() {
+		return true, hasCJS
+	}
+	// Fall back to scanning Imports() for actual import/export declarations
+	// (not require() calls or dynamic imports).
+	for _, imp := range file.Imports() {
+		if imp.Flags&ast.NodeFlagsSynthesized != 0 {
+			continue
+		}
+		parent := imp.Parent
+		if parent == nil {
+			continue
+		}
+		switch parent.Kind {
+		case ast.KindImportDeclaration, ast.KindJSImportDeclaration, ast.KindExportDeclaration:
+			return true, hasCJS
+		case ast.KindExternalModuleReference:
+			// import x = require("...") — this is ESM-ish syntax
+			return true, hasCJS
+		}
+	}
+	return hasESM, hasCJS
+}
+
 func (v *View) computeShouldUseRequire() bool {
 	// 1. TypeScript files don't use require variable declarations
 	if !tspath.HasJSFileExtension(v.importingFile.FileName()) {
@@ -866,20 +954,14 @@ func (v *View) computeShouldUseRequire() bool {
 	}
 
 	// 2. If the current source file is unambiguously CJS or ESM, go with that
-	switch {
-	case v.importingFile.CommonJSModuleIndicator != nil && v.importingFile.ExternalModuleIndicator == nil:
+	switch detectSyntax(v.importingFile, v.program.Options()) {
+	case fileSyntaxKindCJS:
 		return true
-	case v.importingFile.ExternalModuleIndicator != nil && v.importingFile.CommonJSModuleIndicator == nil:
+	case fileSyntaxKindESM:
 		return false
 	}
 
-	// 3. If there's a tsconfig/jsconfig, use its module setting
-	if v.program.Options().ConfigFilePath != "" {
-		return v.program.Options().GetEmitModuleKind() < core.ModuleKindES2015
-	}
-
-	// 4. In --module nodenext, assume we're not emitting JS -> JS, so use
-	//    whatever syntax Node expects based on the detected module kind
+	// 3. Use the implied node format to determine CJS vs ESM
 	//    TODO: consider removing `impliedNodeFormatForEmit`
 	switch v.program.GetImpliedNodeFormatForEmit(v.importingFile) {
 	case core.ModuleKindCommonJS:
@@ -888,14 +970,21 @@ func (v *View) computeShouldUseRequire() bool {
 		return false
 	}
 
+	// 4. If there's a tsconfig/jsconfig, use its module setting
+	if v.program.Options().ConfigFilePath != "" {
+		return v.program.Options().GetEmitModuleKind() < core.ModuleKindES2015
+	}
+
 	// 5. Match the first other JS file in the program that's unambiguously CJS or ESM
 	for _, otherFile := range v.program.GetSourceFiles() {
 		switch {
 		case otherFile == v.importingFile, !ast.IsSourceFileJS(otherFile), v.program.IsSourceFileFromExternalLibrary(otherFile):
 			continue
-		case otherFile.CommonJSModuleIndicator != nil && otherFile.ExternalModuleIndicator == nil:
+		}
+		switch detectSyntax(otherFile, v.program.Options()) {
+		case fileSyntaxKindCJS:
 			return true
-		case otherFile.ExternalModuleIndicator != nil && otherFile.CommonJSModuleIndicator == nil:
+		case fileSyntaxKindESM:
 			return false
 		}
 	}
@@ -1220,14 +1309,20 @@ func getModuleSpecifierText(promotedDeclaration *ast.Node) string {
 		importEqualsDeclaration := promotedDeclaration.AsImportEqualsDeclaration()
 		if ast.IsExternalModuleReference(importEqualsDeclaration.ModuleReference) {
 			expr := importEqualsDeclaration.ModuleReference.Expression()
-			if expr != nil && expr.Kind == ast.KindStringLiteral {
-				return expr.Text()
+			if expr != nil {
+				if ast.IsStringLiteralLike(expr) {
+					return expr.Text()
+				}
+				return scanner.GetTextOfNode(expr)
 			}
-
 		}
-		return importEqualsDeclaration.ModuleReference.Text()
+		return scanner.GetTextOfNode(importEqualsDeclaration.ModuleReference)
 	}
-	return promotedDeclaration.Parent.ModuleSpecifier().Text()
+	moduleSpecifier := promotedDeclaration.Parent.ModuleSpecifier()
+	if ast.IsStringLiteralLike(moduleSpecifier) {
+		return moduleSpecifier.Text()
+	}
+	return scanner.GetTextOfNode(moduleSpecifier)
 }
 
 // returns `-1` if `a` is better than `b`

@@ -10,6 +10,7 @@ import (
 
 	"github.com/microsoft/typescript-go/internal/bundled"
 	"github.com/microsoft/typescript-go/internal/core"
+	"github.com/microsoft/typescript-go/internal/locale"
 	"github.com/microsoft/typescript-go/internal/ls/lsutil"
 	"github.com/microsoft/typescript-go/internal/lsp/lsproto"
 	"github.com/microsoft/typescript-go/internal/project"
@@ -110,6 +111,27 @@ func TestSession(t *testing.T) {
 			assert.NilError(t, err)
 			program := ls.GetProgram()
 			assert.Assert(t, program.GetSourceFile("/home/projects/TS/p1/index.js") != nil)
+		})
+
+		t.Run("inferred project extensionless file", func(t *testing.T) {
+			t.Parallel()
+			files := map[string]any{
+				"/home/projects/TS/p1/script": `const x = 1;`,
+			}
+			session, _ := projecttestutil.Setup(files)
+
+			session.DidOpenFile(context.Background(), "file:///home/projects/TS/p1/script", 1, files["/home/projects/TS/p1/script"].(string), lsproto.LanguageKind("plaintext"))
+
+			snapshot := session.Snapshot()
+			assert.Equal(t, len(snapshot.ProjectCollection.Projects()), 1)
+			assert.Assert(t, snapshot.ProjectCollection.InferredProject() != nil)
+
+			ls, err := session.GetLanguageService(context.Background(), "file:///home/projects/TS/p1/script")
+			assert.NilError(t, err)
+			program := ls.GetProgram()
+			file := program.GetSourceFile("/home/projects/TS/p1/script")
+			assert.Assert(t, file != nil)
+			assert.Equal(t, file.ScriptKind, core.ScriptKindTS)
 		})
 	})
 
@@ -537,7 +559,8 @@ func TestSession(t *testing.T) {
 			assert.NilError(t, err)
 			program2 := ls2.GetProgram()
 
-			assert.Equal(t,
+			assert.Equal(
+				t,
 				program1.GetSourceFile("/home/projects/TS/p1/src/x.ts"),
 				program2.GetSourceFile("/home/projects/TS/p1/src/x.ts"),
 			)
@@ -908,6 +931,94 @@ func TestSession(t *testing.T) {
 			assert.Check(t, program.GetSourceFile("/home/projects/TS/p1/src/sub/x.ts") == nil)
 			// The import should now be an error since the module is missing.
 			assert.Equal(t, len(program.GetSemanticDiagnostics(projecttestutil.WithRequestID(t.Context()), program.GetSourceFile("/home/projects/TS/p1/src/index.ts"))), 1)
+		})
+
+		t.Run("delete sibling folder schedules diagnostics refresh", func(t *testing.T) {
+			t.Parallel()
+			files := map[string]any{
+				"/home/projects/TS/p1/tsconfig.json": `{
+					"compilerOptions": {
+						"noLib": true
+					},
+					"files": ["index.ts"]
+				}`,
+				"/home/projects/TS/p1/index.ts": `import { content } from "./f/content";
+
+export const value = content;`,
+				"/home/projects/TS/p1/f/content.ts": `export const content = 1;`,
+			}
+			session, utils := projecttestutil.Setup(files)
+			contentURI := lsproto.DocumentUri("file:///home/projects/TS/p1/f/content.ts")
+			session.DidOpenFile(context.Background(), "file:///home/projects/TS/p1/index.ts", 1, files["/home/projects/TS/p1/index.ts"].(string), lsproto.LanguageKindTypeScript)
+			session.DidOpenFile(context.Background(), contentURI, 1, files["/home/projects/TS/p1/f/content.ts"].(string), lsproto.LanguageKindTypeScript)
+
+			_, err := session.GetLanguageService(context.Background(), "file:///home/projects/TS/p1/index.ts")
+			assert.NilError(t, err)
+			session.WaitForBackgroundTasks()
+
+			baselineRefreshCount := len(utils.Client().RefreshDiagnosticsCalls())
+
+			err = utils.FS().Remove("/home/projects/TS/p1/f")
+			assert.NilError(t, err)
+
+			session.DidChangeWatchedFiles(context.Background(), []*lsproto.FileEvent{
+				{
+					Type: lsproto.FileChangeTypeDeleted,
+					Uri:  "file:///home/projects/TS/p1/f",
+				},
+			})
+			session.DidCloseFile(context.Background(), contentURI)
+			session.WaitForBackgroundTasks()
+
+			refreshCount := len(utils.Client().RefreshDiagnosticsCalls())
+			assert.Assert(t, refreshCount > baselineRefreshCount,
+				"expected RefreshDiagnostics to be called after deleting /home/projects/TS/p1/f, got %d calls (baseline %d)",
+				refreshCount, baselineRefreshCount)
+		})
+
+		t.Run("delete sibling folder schedules diagnostics refresh after opening third file", func(t *testing.T) {
+			t.Parallel()
+			files := map[string]any{
+				"/home/projects/TS/p1/tsconfig.json": `{
+					"compilerOptions": {
+						"noLib": true
+					},
+					"files": ["index.ts", "third.ts"]
+				}`,
+				"/home/projects/TS/p1/index.ts": `import { content } from "./f/content";
+
+export const value = content;`,
+				"/home/projects/TS/p1/f/content.ts": `export const content = 1;`,
+				"/home/projects/TS/p1/third.ts":     `export const third = 3;`,
+			}
+			session, utils := projecttestutil.Setup(files)
+			contentURI := lsproto.DocumentUri("file:///home/projects/TS/p1/f/content.ts")
+			thirdURI := lsproto.DocumentUri("file:///home/projects/TS/p1/third.ts")
+			session.DidOpenFile(context.Background(), "file:///home/projects/TS/p1/index.ts", 1, files["/home/projects/TS/p1/index.ts"].(string), lsproto.LanguageKindTypeScript)
+			session.DidOpenFile(context.Background(), contentURI, 1, files["/home/projects/TS/p1/f/content.ts"].(string), lsproto.LanguageKindTypeScript)
+
+			_, err := session.GetLanguageService(context.Background(), "file:///home/projects/TS/p1/index.ts")
+			assert.NilError(t, err)
+			session.WaitForBackgroundTasks()
+
+			baselineRefreshCount := len(utils.Client().RefreshDiagnosticsCalls())
+
+			err = utils.FS().Remove("/home/projects/TS/p1/f")
+			assert.NilError(t, err)
+
+			session.DidChangeWatchedFiles(context.Background(), []*lsproto.FileEvent{
+				{
+					Type: lsproto.FileChangeTypeDeleted,
+					Uri:  "file:///home/projects/TS/p1/f",
+				},
+			})
+			session.DidOpenFile(context.Background(), thirdURI, 1, files["/home/projects/TS/p1/third.ts"].(string), lsproto.LanguageKindTypeScript)
+			session.WaitForBackgroundTasks()
+
+			refreshCount := len(utils.Client().RefreshDiagnosticsCalls())
+			assert.Assert(t, refreshCount > baselineRefreshCount,
+				"expected RefreshDiagnostics to be called after deleting /home/projects/TS/p1/f and opening /home/projects/TS/p1/third.ts, got %d calls (baseline %d)",
+				refreshCount, baselineRefreshCount)
 		})
 
 		t.Run("create explicitly included file", func(t *testing.T) {
@@ -1290,6 +1401,81 @@ func TestSession(t *testing.T) {
 			assert.Check(t, slices.Contains(program.CommandLine().ParsedConfig.FileNames, "/home/projects/TS/p1/src/linked/utils.ts"))
 			assert.Check(t, slices.Contains(program.CommandLine().ParsedConfig.FileNames, "/home/projects/TS/p1/src/linked/helpers.ts"))
 		})
+
+		t.Run("skips irrelevant extensions", func(t *testing.T) {
+			t.Parallel()
+			files := map[string]any{
+				"/home/projects/TS/p1/tsconfig.json": `{
+					"compilerOptions": {},
+					"include": ["src"]
+				}`,
+				"/home/projects/TS/p1/src/index.ts": `export const x = 1;`,
+			}
+			session, utils := projecttestutil.Setup(files)
+
+			session.DidOpenFile(context.Background(), "file:///home/projects/TS/p1/src/index.ts", 1, files["/home/projects/TS/p1/src/index.ts"].(string), lsproto.LanguageKindTypeScript)
+			session.WaitForBackgroundTasks()
+
+			baselineRefreshCount := len(utils.Client().RefreshDiagnosticsCalls())
+
+			// Scenario A: irrelevant .svg
+			session.DidChangeWatchedFiles(context.Background(), []*lsproto.FileEvent{
+				{Type: lsproto.FileChangeTypeCreated, Uri: "file:///home/projects/TS/p1/icon.svg"},
+			})
+			session.WaitForBackgroundTasks()
+			refreshCount := len(utils.Client().RefreshDiagnosticsCalls())
+			assert.Equal(t, refreshCount, baselineRefreshCount, "irrelevant .svg should not trigger refresh")
+
+			// Scenario B: relevant .ts
+			session.DidChangeWatchedFiles(context.Background(), []*lsproto.FileEvent{
+				{Type: lsproto.FileChangeTypeCreated, Uri: "file:///home/projects/TS/p1/src/new.ts"},
+			})
+			session.WaitForBackgroundTasks()
+			refreshCount = len(utils.Client().RefreshDiagnosticsCalls())
+			assert.Assert(t, refreshCount > baselineRefreshCount, "relevant .ts should trigger refresh")
+			baselineRefreshCount = refreshCount
+
+			// Scenario C: tsconfig.json
+			session.DidChangeWatchedFiles(context.Background(), []*lsproto.FileEvent{
+				{Type: lsproto.FileChangeTypeChanged, Uri: "file:///home/projects/TS/p1/tsconfig.json"},
+			})
+			session.WaitForBackgroundTasks()
+			refreshCount = len(utils.Client().RefreshDiagnosticsCalls())
+			assert.Assert(t, refreshCount > baselineRefreshCount, "tsconfig.json should trigger refresh")
+			baselineRefreshCount = refreshCount
+
+			// Scenario D: directory creation (no extension)
+			mapFS := utils.FsFromFileMap().FSys().(*vfstest.MapFS)
+			assert.NilError(t, mapFS.MkdirAll("home/projects/TS/p1/node_modules/@types", fs.ModePerm))
+			session.DidChangeWatchedFiles(context.Background(), []*lsproto.FileEvent{
+				{Type: lsproto.FileChangeTypeCreated, Uri: "file:///home/projects/TS/p1/node_modules/@types"},
+			})
+			session.WaitForBackgroundTasks()
+			refreshCount = len(utils.Client().RefreshDiagnosticsCalls())
+			assert.Assert(t, refreshCount > baselineRefreshCount, "directory change should trigger refresh")
+			baselineRefreshCount = refreshCount
+
+			// Scenario E: mixed batch
+			session.DidChangeWatchedFiles(context.Background(), []*lsproto.FileEvent{
+				{Type: lsproto.FileChangeTypeCreated, Uri: "file:///home/projects/TS/p1/icon.png"},
+				{Type: lsproto.FileChangeTypeChanged, Uri: "file:///home/projects/TS/p1/src/index.ts"},
+			})
+			session.WaitForBackgroundTasks()
+			refreshCount = len(utils.Client().RefreshDiagnosticsCalls())
+			assert.Assert(t, refreshCount > baselineRefreshCount, "mixed batch with relevant file should trigger refresh")
+			baselineRefreshCount = refreshCount
+
+			// Scenario F: package install noise
+			session.DidChangeWatchedFiles(context.Background(), []*lsproto.FileEvent{
+				{Type: lsproto.FileChangeTypeCreated, Uri: "file:///home/projects/TS/p1/node_modules/pkg/LICENSE"},
+				{Type: lsproto.FileChangeTypeCreated, Uri: "file:///home/projects/TS/p1/README.md"},
+				{Type: lsproto.FileChangeTypeCreated, Uri: "file:///home/projects/TS/p1/LICENSE.txt"},
+				{Type: lsproto.FileChangeTypeCreated, Uri: "file:///home/projects/TS/p1/style.css"},
+			})
+			session.WaitForBackgroundTasks()
+			refreshCount = len(utils.Client().RefreshDiagnosticsCalls())
+			assert.Equal(t, refreshCount, baselineRefreshCount, "package install noise should not trigger refresh")
+		})
 	})
 
 	t.Run("refreshes code lenses and inlay hints when relevant user preferences change", func(t *testing.T) {
@@ -1317,6 +1503,98 @@ func TestSession(t *testing.T) {
 		assert.Equal(t, len(inlayHintsRefreshCalls), 1, "expected one RefreshInlayHints call after inlay hints preference change")
 	})
 
+	t.Run("sets locale when configured", func(t *testing.T) {
+		t.Parallel()
+		session, utils := projecttestutil.Setup(map[string]any{})
+		prefs := lsutil.NewDefaultUserPreferences()
+		prefs.Locale = "fr"
+
+		session.Configure(prefs)
+
+		setLocaleCalls := utils.Client().SetLocaleCalls()
+		assert.Equal(t, len(setLocaleCalls), 1)
+		assert.Equal(t, setLocaleCalls[0].LocaleMoqParam, "fr")
+	})
+
+	t.Run("locale change invalidates programs", func(t *testing.T) {
+		t.Parallel()
+		files := map[string]any{
+			"/src/tsconfig.json": "{}",
+			"/src/index.ts":      "export const x = 1;",
+		}
+		session, _ := projecttestutil.Setup(files)
+		defer session.Close()
+		ctx := context.Background()
+		uri := lsproto.DocumentUri("file:///src/index.ts")
+		configPath := tspath.Path("/src/tsconfig.json")
+		session.DidOpenFile(ctx, uri, 1, files["/src/index.ts"].(string), lsproto.LanguageKindTypeScript)
+		_, err := session.GetLanguageService(ctx, uri)
+		assert.NilError(t, err)
+		initialProgram := session.Snapshot().ProjectCollection.ConfiguredProject(configPath).Program
+
+		preferences := session.Config()
+		preferences.CodeLens.ReferencesCodeLensEnabled = core.TSTrue
+		session.Configure(preferences)
+		_, err = session.GetLanguageService(ctx, uri)
+		assert.NilError(t, err)
+		programAfterCodeLensChange := session.Snapshot().ProjectCollection.ConfiguredProject(configPath).Program
+		assert.Equal(t, programAfterCodeLensChange, initialProgram)
+
+		preferences.Locale = "fr"
+		session.Configure(preferences)
+		_, err = session.GetLanguageService(ctx, uri)
+		assert.NilError(t, err)
+		programAfterLocaleChange := session.Snapshot().ProjectCollection.ConfiguredProject(configPath).Program
+		assert.Assert(t, programAfterLocaleChange != initialProgram)
+	})
+
+	t.Run("adds locale to background contexts", func(t *testing.T) {
+		t.Parallel()
+		session, utils := projecttestutil.Setup(map[string]any{})
+		fr, ok := locale.Parse("fr")
+		assert.Assert(t, ok)
+		utils.Client().GetLocaleFunc = func() locale.Locale {
+			return fr
+		}
+		utils.Client().RefreshCodeLensFunc = func(ctx context.Context) error {
+			assert.Equal(t, locale.FromContext(ctx), fr)
+			return nil
+		}
+		prefs := lsutil.NewDefaultUserPreferences()
+		prefs.CodeLens.ReferencesCodeLensEnabled = core.TSTrue
+
+		session.Configure(prefs)
+
+		assert.Equal(t, len(utils.Client().RefreshCodeLensCalls()), 1)
+	})
+
+	t.Run("schedules diagnostics refresh when reportStyleChecksAsWarnings changes", func(t *testing.T) {
+		t.Parallel()
+		files := map[string]any{
+			"/src/tsconfig.json": "{}",
+			"/src/index.ts":      "export const x = 1;",
+		}
+		session, utils := projecttestutil.Setup(files)
+		session.DidOpenFile(context.Background(), "file:///src/index.ts", 1, files["/src/index.ts"].(string), lsproto.LanguageKindTypeScript)
+		_, err := session.GetLanguageService(context.Background(), lsproto.DocumentUri("file:///src/index.ts"))
+		assert.NilError(t, err)
+		session.WaitForBackgroundTasks()
+
+		// Record the baseline count of RefreshDiagnostics calls.
+		baselineRefreshCount := len(utils.Client().RefreshDiagnosticsCalls())
+
+		// Toggle reportStyleChecksAsWarnings (default is true, so set it to false).
+		prefs := lsutil.NewDefaultUserPreferences()
+		prefs.ReportStyleChecksAsWarnings = core.TSFalse
+		session.Configure(prefs)
+		session.WaitForBackgroundTasks()
+
+		refreshCount := len(utils.Client().RefreshDiagnosticsCalls())
+		assert.Assert(t, refreshCount > baselineRefreshCount,
+			"expected RefreshDiagnostics to be called after reportStyleChecksAsWarnings change, got %d calls (baseline %d)",
+			refreshCount, baselineRefreshCount)
+	})
+
 	t.Run("config parsing", func(t *testing.T) {
 		t.Parallel()
 		files := map[string]any{
@@ -1334,7 +1612,7 @@ func TestSession(t *testing.T) {
 				"quoteStyle":           "single",
 			},
 			"unstable": map[string]any{
-				"organizeImportsIgnoreCase": true,
+				"organizeImportsSort": "ordinalIgnoreCase",
 			},
 		}
 		session.Configure(lsutil.ParseUserPreferences(map[string]any{"js/ts": configMap1}))
@@ -1342,7 +1620,7 @@ func TestSession(t *testing.T) {
 		expectedPrefs1 := lsutil.NewDefaultUserPreferences()
 		expectedPrefs1.UseAliasesForRename = core.TSTrue
 		expectedPrefs1.QuotePreference = lsutil.QuotePreferenceSingle
-		expectedPrefs1.OrganizeImportsIgnoreCase = core.TSTrue
+		expectedPrefs1.OrganizeImportsSort = lsutil.OrganizeImportsSortOrdinalIgnoreCase
 
 		assert.DeepEqual(t, actualConfig1, expectedPrefs1)
 
@@ -1352,7 +1630,7 @@ func TestSession(t *testing.T) {
 				"quoteStyle":           "double",
 			},
 			"unstable": map[string]any{
-				"organizeImportsIgnoreCase": false,
+				"organizeImportsSort": "ordinal",
 			},
 		}
 		session.Configure(lsutil.ParseUserPreferences(map[string]any{"js/ts": configMap2}))
@@ -1360,7 +1638,7 @@ func TestSession(t *testing.T) {
 		expectedPrefs2 := lsutil.NewDefaultUserPreferences()
 		expectedPrefs2.UseAliasesForRename = core.TSFalse
 		expectedPrefs2.QuotePreference = lsutil.QuotePreferenceDouble
-		expectedPrefs2.OrganizeImportsIgnoreCase = core.TSFalse
+		expectedPrefs2.OrganizeImportsSort = lsutil.OrganizeImportsSortOrdinal
 
 		assert.DeepEqual(t, actualConfig2, expectedPrefs2)
 	})
@@ -1417,5 +1695,44 @@ func TestSession(t *testing.T) {
 			assert.Assert(t, sourceFile != nil)
 			assert.Equal(t, sourceFile.Text(), `const greeting: string = "hello";`)
 		})
+	})
+
+	t.Run("jsconfig.json used for JS files when tsconfig.json exists in same directory", func(t *testing.T) {
+		t.Parallel()
+		files := map[string]any{
+			"/home/projects/TS/p1/tsconfig.json": `{
+				"compilerOptions": {
+					"noLib": true,
+					"strict": true
+				}
+			}`,
+			"/home/projects/TS/p1/jsconfig.json": `{
+				"compilerOptions": {
+					"noLib": true,
+					"checkJs": true
+				}
+			}`,
+			"/home/projects/TS/p1/index.ts": `export const x: number = 1;`,
+			"/home/projects/TS/p1/app.js":   `/** @type {number} */ var y = "not a number";`,
+		}
+		session, _ := projecttestutil.Setup(files)
+
+		// Open the JS file - it should be assigned to the jsconfig.json project, not tsconfig.json
+		session.DidOpenFile(context.Background(), "file:///home/projects/TS/p1/app.js", 1, files["/home/projects/TS/p1/app.js"].(string), lsproto.LanguageKindJavaScript)
+
+		snapshot := session.Snapshot()
+		jsURI := lsproto.DocumentUri("file:///home/projects/TS/p1/app.js")
+		defaultProject := snapshot.GetDefaultProject(jsURI)
+		assert.Assert(t, defaultProject != nil, "JS file should have a default project")
+		assert.Equal(t, defaultProject.Name(), "/home/projects/TS/p1/jsconfig.json", "JS file should belong to jsconfig.json project, not tsconfig.json")
+
+		// Open the TS file - it should be assigned to tsconfig.json project
+		session.DidOpenFile(context.Background(), "file:///home/projects/TS/p1/index.ts", 1, files["/home/projects/TS/p1/index.ts"].(string), lsproto.LanguageKindTypeScript)
+
+		snapshot = session.Snapshot()
+		tsURI := lsproto.DocumentUri("file:///home/projects/TS/p1/index.ts")
+		defaultTSProject := snapshot.GetDefaultProject(tsURI)
+		assert.Assert(t, defaultTSProject != nil, "TS file should have a default project")
+		assert.Equal(t, defaultTSProject.Name(), "/home/projects/TS/p1/tsconfig.json", "TS file should belong to tsconfig.json project")
 	})
 }

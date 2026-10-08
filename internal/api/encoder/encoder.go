@@ -1,11 +1,15 @@
 package encoder
 
 import (
+	"cmp"
 	"encoding/binary"
 	"fmt"
 	"slices"
+	"sync"
 
 	"github.com/microsoft/typescript-go/internal/ast"
+	"github.com/microsoft/typescript-go/internal/core"
+	"github.com/microsoft/typescript-go/internal/spanmap"
 	"github.com/zeebo/xxh3"
 )
 
@@ -59,7 +63,7 @@ const (
 )
 
 const (
-	ProtocolVersion uint8 = 5
+	ProtocolVersion uint8 = 7
 )
 
 // Source File Binary Format
@@ -108,10 +112,11 @@ const (
 // String data (variable)
 // ----------------------
 //
-// The string data section contains UTF-8 encoded string data. In typical cases, the entirety of the string data is the
-// source file text, and individual nodes with string properties reference their positional slice of the file text. In
-// cases where a node's string property is not equal to the slice of file text at its position, the unique string is
-// appended to the string data section after the file text.
+// The string data section contains UTF-8 encoded string data, with WTF-8 used for JS strings containing lone UTF-16
+// surrogates. In typical cases, the entirety of the string data is the source file text, and individual nodes with
+// string properties reference their positional slice of the file text. In cases where a node's string property is not
+// equal to the slice of file text at its position, the unique string is appended to the string data section after the
+// file text.
 //
 // Extended node data (variable)
 // -----------------------------
@@ -144,6 +149,13 @@ const (
 // | 36-40       | uint32 | Byte offset of `moduleAugmentations` node index array         |
 // | 40-44       | uint32 | Byte offset of `ambientModuleNames` string array              |
 // | 44-48       | uint32 | Node index of `externalModuleIndicator` (0 = nil)             |
+// | 48-52       | uint32 | Index of `originalText` in the string offsets section         |
+// | 52-56       | uint32 | Byte offset of `spanMap` in structured data                    |
+// | 56-60       | uint32 | Byte offset of `supplementalSourceFileNames` in structured data |
+// | 60-64       | uint32 | Index of `canonicalSourceFileName`, or noStructuredData         |
+// | 64-68       | uint32 | Index of `contentMapper`, or noStructuredData                   |
+// | 68-72       | uint32 | Index of `virtualFileName`, or noStructuredData                 |
+// | 72-76       | uint32 | Byte offset of `diagnosticDirectives` in structured data       |
 //
 // Structured data (variable)
 // --------------------------
@@ -156,6 +168,14 @@ const (
 // Node index arrays (imports, moduleAugmentations) are msgpack arrays of uint values, where each
 // value is a node index into the nodes section. String arrays (ambientModuleNames) are msgpack
 // arrays of string values.
+//
+// Span maps are msgpack arrays of tuples in UTF-16 coordinates:
+//
+//	[virtualStart: uint, virtualLength: uint, originalStart: uint, originalLength: uint, kind: uint, features?: uint]
+//
+// Diagnostic directives are msgpack arrays of normalized tuples in UTF-16 coordinates:
+//
+//	[originalStart: uint, originalLength: uint, virtualStart: uint, virtualLength: uint, policy: uint, unusedCode: uint]
 //
 // An offset of 0xFFFFFFFF indicates no data (empty array).
 //
@@ -297,19 +317,119 @@ func encodeParseOptions(opts ast.ExternalModuleIndicatorOptions) uint32 {
 	return bits
 }
 
+// NodeIndexTable maps between AST nodes and their encoder indices for O(1) node handle resolution.
+type NodeIndexTable struct {
+	Nodes      []*ast.Node // index → node (for resolution)
+	sortedOnce sync.Once
+	sortedIdx  []uint32 // indices into Nodes, sorted by node ID; built lazily
+}
+
+var nodeIndexTableKey = ast.NewSourceFileDataKey[*NodeIndexTable]()
+
+// GetIndex returns the encoder index for the given node.
+// On the first call the sortedIdx array is built (O(n log n) sort on a flat []uint32),
+// then subsequent calls use binary search (O(log n)). This turns out to be much faster than
+// building a map[*ast.Node]uint32 and not significantly slower for lookups.
+func (t *NodeIndexTable) GetIndex(node *ast.Node) uint32 {
+	t.sortedOnce.Do(func() {
+		idx := make([]uint32, 0, len(t.Nodes))
+		for i, n := range t.Nodes {
+			if n != nil {
+				idx = append(idx, uint32(i))
+			}
+		}
+		nodes := t.Nodes
+		slices.SortFunc(idx, func(a, b uint32) int {
+			return cmp.Compare(ast.GetNodeId(nodes[a]), ast.GetNodeId(nodes[b]))
+		})
+		t.sortedIdx = idx
+	})
+	target := ast.GetNodeId(node)
+	i, found := core.BinarySearchUniqueFunc(t.sortedIdx, func(_ int, el uint32) int {
+		return cmp.Compare(ast.GetNodeId(t.Nodes[el]), target)
+	})
+	if found {
+		return t.sortedIdx[i]
+	}
+	return 0
+}
+
+// BuildNodeIndexTable walks the AST in the same order as encodeTree and builds
+// a NodeIndexTable without performing the full binary encoding. This is used to
+// eagerly create index tables for files that need node handles before getSourceFile
+// is called. The indices produced are guaranteed to match those from EncodeSourceFile.
+func BuildNodeIndexTable(sourceFile *ast.SourceFile) *NodeIndexTable {
+	var nodeCount uint32
+	nodeTable := make([]*ast.Node, 1, sourceFile.NodeCount+1) // index 0 = nil sentinel
+
+	visitor := &ast.NodeVisitor{
+		Hooks: ast.NodeVisitorHooks{
+			VisitNodes: func(nodeList *ast.NodeList, visitor *ast.NodeVisitor) *ast.NodeList {
+				if nodeList == nil {
+					return nodeList
+				}
+				nodeCount++
+				nodeTable = append(nodeTable, nil) // NodeLists are not *ast.Node
+				visitor.VisitSlice(nodeList.Nodes)
+				return nodeList
+			},
+			VisitModifiers: func(modifiers *ast.ModifierList, visitor *ast.NodeVisitor) *ast.ModifierList {
+				if modifiers != nil && len(modifiers.Nodes) > 0 {
+					visitor.Hooks.VisitNodes(&modifiers.NodeList, visitor)
+				}
+				return modifiers
+			},
+		},
+	}
+	visitor.Visit = func(node *ast.Node) *ast.Node {
+		nodeCount++
+		nodeTable = append(nodeTable, node)
+		visitor.VisitEachChild(node)
+		for _, jsdoc := range node.JSDoc(sourceFile) {
+			visitor.Visit(jsdoc)
+		}
+		return node
+	}
+
+	rootNode := sourceFile.AsNode()
+	// Index 1 = root node (matches encodeTree)
+	nodeCount++
+	nodeTable = append(nodeTable, rootNode)
+
+	visitor.VisitEachChild(rootNode)
+	for _, jsdoc := range rootNode.JSDoc(sourceFile) {
+		visitor.Visit(jsdoc)
+	}
+
+	return &NodeIndexTable{Nodes: nodeTable}
+}
+
+func GetNodeIndexTable(sourceFile *ast.SourceFile) *NodeIndexTable {
+	return ast.GetOrComputeSourceFileData(sourceFile, nodeIndexTableKey, BuildNodeIndexTable)
+}
+
 // EncodeSourceFile encodes an entire source file AST into the binary format.
-func EncodeSourceFile(sourceFile *ast.SourceFile) ([]byte, error) {
-	return encodeTree(sourceFile.AsNode(), sourceFile)
+// Returns the encoded bytes and a NodeIndexTable mapping encoder indices to AST nodes.
+func EncodeSourceFile(sourceFile *ast.SourceFile) ([]byte, *NodeIndexTable, error) {
+	data, nodeTable, err := encodeTree(sourceFile.AsNode(), sourceFile)
+	if err != nil {
+		return nil, nil, err
+	}
+	nodeTable = ast.GetOrComputeSourceFileData(sourceFile, nodeIndexTableKey, func(*ast.SourceFile) *NodeIndexTable {
+		return nodeTable
+	})
+	return data, nodeTable, nil
 }
 
 // EncodeNode encodes an arbitrary AST node and its descendants into the binary format.
 // The sourceFile is needed to provide the source text for efficient string encoding.
 // When encoding a non-SourceFile node, the header hash and parse options fields will be zero.
-func EncodeNode(node *ast.Node, sourceFile *ast.SourceFile) ([]byte, error) {
+// Returns the encoded bytes and a NodeIndexTable mapping encoder indices to AST nodes.
+func EncodeNode(node *ast.Node, sourceFile *ast.SourceFile) ([]byte, *NodeIndexTable, error) {
 	return encodeTree(node, sourceFile)
 }
 
-func encodeTree(rootNode *ast.Node, sourceFile *ast.SourceFile) ([]byte, error) {
+func encodeTree(rootNode *ast.Node, sourceFile *ast.SourceFile) ([]byte, *NodeIndexTable, error) {
 	var parentIndex, nodeCount, prevIndex uint32
 	var extendedData []byte
 	var structuredData []byte
@@ -335,6 +455,10 @@ func encodeTree(rootNode *ast.Node, sourceFile *ast.SourceFile) ([]byte, error) 
 		initialNodeCount = sourceFile.NodeCount
 	}
 	nodes := make([]byte, 0, (initialNodeCount+1)*NodeSize)
+
+	// Build node index table for O(1) handle resolution.
+	// Index 0 is a nil sentinel; real nodes start at index 1.
+	nodeTable := make([]*ast.Node, 1, initialNodeCount+1) // index 0 = nil sentinel
 
 	// Build a small map of nodes we need to track indices for (imports + moduleAugmentations).
 	// Values start at 0 and are filled in during the walk.
@@ -368,6 +492,7 @@ func encodeTree(rootNode *ast.Node, sourceFile *ast.SourceFile) ([]byte, error) 
 				}
 
 				nodeCount++
+				nodeTable = append(nodeTable, nil) // NodeLists are not *ast.Node
 				if prevIndex != 0 {
 					// this is the next sibling of `prevNode`
 					b0, b1, b2, b3 := uint8(nodeCount), uint8(nodeCount>>8), uint8(nodeCount>>16), uint8(nodeCount>>24)
@@ -400,6 +525,7 @@ func encodeTree(rootNode *ast.Node, sourceFile *ast.SourceFile) ([]byte, error) 
 	}
 	visitor.Visit = func(node *ast.Node) *ast.Node {
 		nodeCount++
+		nodeTable = append(nodeTable, node)
 		if prevIndex != 0 {
 			// this is the next sibling of `prevNode`
 			b0, b1, b2, b3 := uint8(nodeCount), uint8(nodeCount>>8), uint8(nodeCount>>16), uint8(nodeCount>>24)
@@ -437,6 +563,7 @@ func encodeTree(rootNode *ast.Node, sourceFile *ast.SourceFile) ([]byte, error) 
 
 	nodeCount++
 	parentIndex++
+	nodeTable = append(nodeTable, rootNode) // index 1 = root node
 
 	sfExtendedDataOffset = len(extendedData)
 	nodes = appendUint32s(nodes, uint32(rootNode.Kind), utf16(rootNode.Pos()), utf16(rootNode.End()), 0, 0, getNodeData(rootNode, strs, positionMap, &extendedData, &structuredData), uint32(rootNode.Flags))
@@ -505,7 +632,7 @@ func encodeTree(rootNode *ast.Node, sourceFile *ast.SourceFile) ([]byte, error) 
 		extendedData,
 		structuredData,
 		nodes,
-	), nil
+	), &NodeIndexTable{Nodes: nodeTable}, nil
 }
 
 func appendUint32s(buf []byte, values ...uint32) []byte {
@@ -534,14 +661,37 @@ const noStructuredData = 0xFFFFFFFF
 func recordExtendedData_SourceFile(node *ast.Node, strs *stringTable, positionMap *ast.PositionMap, extendedData *[]byte, structuredData *[]byte) {
 	sf := node.AsSourceFile()
 	textIndex := strs.add(sf.Text(), sf.Kind, sf.Pos(), sf.End())
+	originalTextIndex := textIndex
+	if sf.OriginalText() != sf.Text() {
+		originalTextIndex = strs.add(sf.OriginalText(), 0, 0, 0)
+	}
 	fileNameIndex := strs.add(sf.FileName(), 0, 0, 0)
 	pathIndex := strs.add(string(sf.Path()), 0, 0, 0)
 	referencedFilesOffset := encodeFileReferences(sf.ReferencedFiles, positionMap, structuredData)
 	typeRefDirectivesOffset := encodeFileReferences(sf.TypeReferenceDirectives, positionMap, structuredData)
 	libRefDirectivesOffset := encodeFileReferences(sf.LibReferenceDirectives, positionMap, structuredData)
+	spanMapOffset := uint32(noStructuredData)
+	if spanMap := sf.SpanMap(); spanMap != nil {
+		spanMapOffset = encodeSpanMap(spanMap, positionMap, ast.ComputePositionMap(sf.OriginalText()), structuredData)
+	}
+	supplementalFileNames := core.Map(sf.SupplementalSourceFiles(), func(file *ast.SourceFile) string { return file.FileName() })
+	supplementalFileNamesOffset := encodeStringArray(supplementalFileNames, structuredData)
+	canonicalFileNameIndex := uint32(noStructuredData)
+	if canonical := sf.CanonicalSourceFile(); canonical != nil {
+		canonicalFileNameIndex = strs.add(canonical.FileName(), 0, 0, 0)
+	}
+	contentMapperIndex := uint32(noStructuredData)
+	if contentMapper := sf.ContentMapper(); contentMapper != "" {
+		contentMapperIndex = strs.add(contentMapper, 0, 0, 0)
+	}
+	virtualFileNameIndex := uint32(noStructuredData)
+	if virtualFileName := sf.VirtualFileName(); virtualFileName != "" {
+		virtualFileNameIndex = strs.add(virtualFileName, 0, 0, 0)
+	}
+	diagnosticDirectivesOffset := encodeDiagnosticDirectives(sf.DiagnosticDirectives(), positionMap, ast.ComputePositionMap(sf.OriginalText()), structuredData)
 	// imports, moduleAugmentations, ambientModuleNames offsets are placeholders;
 	// they will be patched after the tree walk when node indices are known.
-	*extendedData = appendUint32s(*extendedData, textIndex, fileNameIndex, pathIndex, uint32(sf.LanguageVariant), uint32(sf.ScriptKind), referencedFilesOffset, typeRefDirectivesOffset, libRefDirectivesOffset, noStructuredData, noStructuredData, noStructuredData, 0)
+	*extendedData = appendUint32s(*extendedData, textIndex, fileNameIndex, pathIndex, uint32(sf.LanguageVariant), uint32(sf.ScriptKind), referencedFilesOffset, typeRefDirectivesOffset, libRefDirectivesOffset, noStructuredData, noStructuredData, noStructuredData, 0, originalTextIndex, spanMapOffset, supplementalFileNamesOffset, canonicalFileNameIndex, contentMapperIndex, virtualFileNameIndex, diagnosticDirectivesOffset)
 }
 
 func recordExtendedData_TemplateHead(node *ast.Node, strs *stringTable, positionMap *ast.PositionMap, extendedData *[]byte, structuredData *[]byte) {
@@ -638,6 +788,57 @@ func encodeStringArray(strs []string, buf *[]byte) uint32 {
 	*buf = msgpackWriteArrayHeader(*buf, len(strs))
 	for _, s := range strs {
 		*buf = msgpackWriteString(*buf, s)
+	}
+	return offset
+}
+
+func encodeSpanMap(m *spanmap.SpanMap, virtualPositions *ast.PositionMap, originalPositions *ast.PositionMap, buf *[]byte) uint32 {
+	if m == nil {
+		return noStructuredData
+	}
+	segments := m.Segments()
+	offset := uint32(len(*buf))
+	*buf = msgpackWriteArrayHeader(*buf, len(segments))
+	for _, segment := range segments {
+		tupleLength := 5
+		if segment.Features != spanmap.FeatureAll {
+			tupleLength = 6
+		}
+		*buf = msgpackWriteArrayHeader(*buf, tupleLength)
+		virtualStart := virtualPositions.UTF8ToUTF16(int(segment.VirtualStart))
+		virtualEnd := virtualPositions.UTF8ToUTF16(int(segment.VirtualEnd))
+		originalStart := originalPositions.UTF8ToUTF16(int(segment.OriginalStart))
+		originalEnd := originalPositions.UTF8ToUTF16(int(segment.OriginalEnd))
+		*buf = msgpackWriteUint(*buf, uint32(virtualStart))
+		*buf = msgpackWriteUint(*buf, uint32(virtualEnd-virtualStart))
+		*buf = msgpackWriteUint(*buf, uint32(originalStart))
+		*buf = msgpackWriteUint(*buf, uint32(originalEnd-originalStart))
+		*buf = msgpackWriteUint(*buf, uint32(segment.Kind))
+		if tupleLength == 6 {
+			*buf = msgpackWriteUint(*buf, uint32(segment.Features))
+		}
+	}
+	return offset
+}
+
+func encodeDiagnosticDirectives(directives []ast.MappedDiagnosticDirective, virtualPositions *ast.PositionMap, originalPositions *ast.PositionMap, buf *[]byte) uint32 {
+	if len(directives) == 0 {
+		return noStructuredData
+	}
+	offset := uint32(len(*buf))
+	*buf = msgpackWriteArrayHeader(*buf, len(directives))
+	for _, directive := range directives {
+		*buf = msgpackWriteArrayHeader(*buf, 6)
+		originalStart := originalPositions.UTF8ToUTF16(directive.OriginalRange.Pos())
+		originalEnd := originalPositions.UTF8ToUTF16(directive.OriginalRange.End())
+		virtualStart := virtualPositions.UTF8ToUTF16(directive.VirtualRange.Pos())
+		virtualEnd := virtualPositions.UTF8ToUTF16(directive.VirtualRange.End())
+		*buf = msgpackWriteUint(*buf, uint32(originalStart))
+		*buf = msgpackWriteUint(*buf, uint32(originalEnd-originalStart))
+		*buf = msgpackWriteUint(*buf, uint32(virtualStart))
+		*buf = msgpackWriteUint(*buf, uint32(virtualEnd-virtualStart))
+		*buf = msgpackWriteUint(*buf, uint32(directive.Policy))
+		*buf = msgpackWriteUint(*buf, uint32(directive.UnusedCode))
 	}
 	return offset
 }
